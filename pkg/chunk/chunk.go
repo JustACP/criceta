@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/JustACP/criceta/pkg/common/logs"
 	"github.com/JustACP/criceta/pkg/common/utils"
@@ -286,6 +287,38 @@ func UpdateSize(force bool) (PrepareFunc, UpdateFunc) {
 		}
 }
 
+func UpdateVer(force bool) (PrepareFunc, UpdateFunc) {
+
+	return func(cf *ChunkFile) {
+			if force {
+				cf.Head.Version = 0
+			}
+		},
+		func(cf *ChunkFile, data []byte) error {
+			if cf.Head == nil {
+				return fmt.Errorf("chunk file Head is nil")
+			}
+			cf.Head.Version++
+			return nil
+		}
+}
+
+func UpdateModifyAt(force bool) (PrepareFunc, UpdateFunc) {
+
+	return func(cf *ChunkFile) {
+			if force {
+				cf.Head.ModifyAt = 0
+			}
+		},
+		func(cf *ChunkFile, data []byte) error {
+			if cf.Head == nil {
+				return fmt.Errorf("chunk file Head is nil")
+			}
+			cf.Head.ModifyAt = time.Now().UnixNano()
+			return nil
+		}
+}
+
 func (cf *ChunkFile) forceUpdateOptions(h *UpdateHandler) error {
 
 	if cf == nil || cf.File == nil || cf.Head == nil {
@@ -488,11 +521,15 @@ func (cf *ChunkFile) Append(data []byte) (int, error) {
 	_, updateCRC := UpdateCRC(false)
 	_, updateSize := UpdateSize(false)
 	_, updateHash := UpdateHash(false)
+	_, updateVer := UpdateVer(false)
+	_, UpdateModifyAt := UpdateModifyAt(false)
 	appendCh := NewUpdateHandler(false, []PrepareFunc{},
 		[]UpdateFunc{
 			updateCRC,
 			updateSize,
 			updateHash,
+			updateVer,
+			UpdateModifyAt,
 		},
 	)
 	return cf.append(data, appendCh)

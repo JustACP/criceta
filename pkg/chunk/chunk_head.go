@@ -99,16 +99,30 @@ func WithStatus(status ChunkStatus) CHOption {
 	})
 }
 
+func WithCreatAt(createAt int64) CHOption {
+	return NewCHOption(func(ch *ChunkHead) {
+		ch.CreateAt = createAt
+	})
+}
+
+func WithModifyAt(modifyAt int64) CHOption {
+	return NewCHOption(func(ch *ChunkHead) {
+		ch.ModifyAt = modifyAt
+	})
+}
+
 type ChunkHead struct {
-	Id      uint64      `json:"ChunkId"`
-	FileId  uint64      `json:"FileId"`
-	CRC     uint32      `json:"CRC"`
-	Hash    *string     `json:"Hash"`
-	Size    uint64      `json:"Size"`
-	Version uint64      `json:"Version"`
-	Pos     uint64      `json:"Pos"` // chunk position in file
-	Off     uint64      `json:"Off"`
-	Status  ChunkStatus `json:"Status"`
+	Id       uint64      `json:"chunk_id"`
+	FileId   uint64      `json:"file_id"`
+	CRC      uint32      `json:"crc"`
+	Hash     *string     `json:"hash"`
+	Size     uint64      `json:"size"`
+	Version  uint64      `json:"version"`
+	Pos      uint64      `json:"pos"` // chunk position in file
+	Off      uint64      `json:"off"`
+	CreateAt int64       `json:"create_at"`
+	ModifyAt int64       `json:"modify_at"`
+	Status   ChunkStatus `json:"status"`
 }
 
 func (ch *ChunkHead) SetStatus(newStatus ChunkStatus) {
@@ -123,26 +137,22 @@ func (ch *ChunkHead) ToBinary() ([]byte, error) {
 	copy(chBytes[startIdx:endIdx], []byte(constant.APP_NAME))
 
 	// Chunk Id 8 Bytes
-	startIdx = endIdx
-	endIdx += 8
+	startIdx, endIdx = endIdx, endIdx+8
 	binary.BigEndian.PutUint64(chBytes[startIdx:endIdx], uint64(ch.Id))
 
 	// Chunk FileId 8 Bytes
-	startIdx = endIdx
-	endIdx += 8
+	startIdx, endIdx = endIdx, endIdx+8
 	binary.BigEndian.PutUint64(chBytes[startIdx:endIdx], uint64(ch.FileId))
 
 	// Chunk CRC 4 Bytes
-	startIdx = endIdx
-	endIdx += 4
+	startIdx, endIdx = endIdx, endIdx+4
 
 	if ch.Hash != nil {
 		binary.BigEndian.PutUint32(chBytes[startIdx:endIdx], uint32(ch.CRC))
 	}
 
 	// Chunk Blake3 Hash 32 Bytes
-	startIdx = endIdx
-	endIdx += 32
+	startIdx, endIdx = endIdx, endIdx+32
 	if ch.Hash != nil {
 		hashBytes, err := hex.DecodeString(*ch.Hash)
 		if err != nil {
@@ -153,24 +163,28 @@ func (ch *ChunkHead) ToBinary() ([]byte, error) {
 	}
 
 	// Chunk File Size 8 Bytes
-	startIdx = endIdx
-	endIdx += 8
+	startIdx, endIdx = endIdx, endIdx+8
 	binary.BigEndian.PutUint64(chBytes[startIdx:endIdx], uint64(ch.Size))
 
 	// Chunk Version 8 Bytes
-	startIdx = endIdx
-	endIdx += 8
+	startIdx, endIdx = endIdx, endIdx+8
 	binary.BigEndian.PutUint64(chBytes[startIdx:endIdx], uint64(ch.Version))
 
 	// Chunk Pos 8 Bytes
-	startIdx = endIdx
-	endIdx += 8
+	startIdx, endIdx = endIdx, endIdx+8
 	binary.BigEndian.PutUint64(chBytes[startIdx:endIdx], uint64(ch.Pos))
 
 	// Chunk Off 8 Bytes
-	startIdx = endIdx
-	endIdx += 8
+	startIdx, endIdx = endIdx, endIdx+8
 	binary.BigEndian.PutUint64(chBytes[startIdx:endIdx], uint64(ch.Off))
+
+	// Chunk CreateAt 8 Bytes
+	startIdx, endIdx = endIdx, endIdx+8
+	binary.BigEndian.PutUint64(chBytes[startIdx:endIdx], uint64(ch.CreateAt))
+
+	// Chunk ModifyAt 8 Bytes
+	startIdx, endIdx = endIdx, endIdx+8
+	binary.BigEndian.PutUint64(chBytes[startIdx:endIdx], uint64(ch.ModifyAt))
 
 	// Chunk Status 2 Bytes
 	startIdx = endIdx
@@ -228,6 +242,12 @@ func (ch *ChunkHead) FromBinary(input []byte) error {
 
 	startIdx, endIdx = endIdx, endIdx+8
 	ch.Off = binary.BigEndian.Uint64(input[startIdx:endIdx])
+
+	startIdx, endIdx = endIdx, endIdx+8
+	ch.CreateAt = int64(binary.BigEndian.Uint64(input[startIdx:endIdx]))
+
+	startIdx, endIdx = endIdx, endIdx+8
+	ch.ModifyAt = int64(binary.BigEndian.Uint64(input[startIdx:endIdx]))
 
 	startIdx, endIdx = endIdx, endIdx+2
 	ch.Status = ChunkStatus(binary.BigEndian.Uint16(input[startIdx:endIdx]))
