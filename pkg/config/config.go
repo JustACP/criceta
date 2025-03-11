@@ -2,10 +2,14 @@ package config
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/JustACP/criceta/pkg/common"
 	"github.com/JustACP/criceta/pkg/common/logs"
+	"github.com/spf13/viper"
 )
 
 type ServerType int16
@@ -14,6 +18,112 @@ const (
 	TRACKER = ServerType(1)
 	STORAGE = ServerType(2)
 )
+
+type InstanceConfig struct {
+	ServerConfig Config
+	cf           *os.File
+	v            *viper.Viper
+	rw           sync.RWMutex
+}
+
+func (ic *InstanceConfig) GetConfig() {
+	ic.rw.RLocker().Lock()
+	defer ic.rw.RLocker().Unlock()
+
+	if ic.v == nil {
+		panic("instance config viper reader is nil")
+	}
+
+	err := ic.v.ReadInConfig()
+	if err != nil {
+		panic(fmt.Sprintf("read config error, err: %v", err.Error()))
+	}
+
+	_, err = ic.ServerConfig.ReadConfig(ic.v.AllSettings())
+	if err != nil {
+		panic(fmt.Sprintf("read config error, err: %v", err.Error()))
+	}
+
+}
+
+func (ic *InstanceConfig) SaveConfig() error {
+	ic.rw.Lock()
+	defer ic.rw.Unlock()
+
+	mapConf := ic.ServerConfig.SaveConfig()
+
+	for k, v := range mapConf {
+		ic.v.Set(k, v)
+	}
+
+	err := ic.v.WriteConfig()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+const configPath = "/etc/criceta"
+const configName = "config"
+const configType = "yaml"
+
+func newViperReader() *viper.Viper {
+
+	v := viper.New()
+	v.AddConfigPath(configPath)
+	v.SetConfigName(configName)
+	v.SetConfigType(configType)
+
+	return v
+}
+
+func NewInstanceConfig(serverType ServerType) *InstanceConfig {
+	instanceConf := &InstanceConfig{}
+
+	switch serverType {
+	case TRACKER:
+		instanceConf.ServerConfig = new(ServerConfig)
+		break
+	case STORAGE:
+		instanceConf.ServerConfig = new(StorageNodeConfig)
+		break
+	default:
+		panic("No Server Type")
+	}
+
+	cf, err := os.OpenFile(
+		filepath.Join(configPath, fmt.Sprintf("%s.%s", configName, configType)),
+		os.O_RDWR,
+		0764,
+	)
+
+	if cf == nil || err != nil {
+		panicMsg := fmt.Sprintf("No config was find, please check config file in : %v", configPath)
+		panic(panicMsg)
+	}
+
+	instanceConf.cf = cf
+
+	return instanceConf
+}
+
+var (
+	instance *InstanceConfig
+	once     sync.Once
+)
+
+func InitInstanceConfig(serverType ServerType) {
+	once.Do(func() {
+		instance := NewInstanceConfig(serverType)
+		instance.GetConfig()
+	})
+}
+
+func GetInstanceConfig() *InstanceConfig {
+
+	return instance
+}
 
 var serverTypeNames = []string{"TRACKER", "STORAGE"}
 
@@ -76,47 +186,6 @@ type LogConfig struct {
 	FilePath *string       `json:"FilePath,omitempty"`
 }
 
-// getParam : get param and convert
-func getParam[T any](input map[string]any, paramName string) (T, error) {
-
-	var paramVal T
-
-	val, exists := input[paramName]
-	if !exists {
-		return paramVal, fmt.Errorf("cannot found param %s", paramName)
-	}
-
-	paramVal, ok := val.(T)
-	if !ok {
-		return paramVal, fmt.Errorf("the param %s is not of type %T, real type: %T", paramName, paramVal, val)
-	}
-
-	return paramVal, nil
-}
-
-func convertEnumParam[T common.Enum](input map[string]any, paramName string) (T, error) {
-
-	var enumVal T
-
-	enumName, err := getParam[string](input, paramName)
-	if err != nil {
-		return enumVal, err
-	}
-
-	enumInstance, err := enumVal.FromString(enumName)
-	if err != nil {
-		return enumVal, err
-	}
-
-	enumVal, ok := enumInstance.(T)
-	if !ok {
-		return enumVal, fmt.Errorf("the param %s assert error, target type %T, real type: %T", paramName, enumVal, enumInstance)
-	}
-
-	return enumVal, nil
-
-}
-
 func (lc *LogConfig) ReadConfig(input map[string]any) (Config, error) {
 	var err error
 
@@ -159,6 +228,47 @@ func (lc *LogConfig) SaveConfig() map[string]any {
 	}
 
 	return logOutput
+}
+
+// getParam : get param and convert
+func getParam[T any](input map[string]any, paramName string) (T, error) {
+
+	var paramVal T
+
+	val, exists := input[paramName]
+	if !exists {
+		return paramVal, fmt.Errorf("cannot found param %s", paramName)
+	}
+
+	paramVal, ok := val.(T)
+	if !ok {
+		return paramVal, fmt.Errorf("the param %s is not of type %T, real type: %T", paramName, paramVal, val)
+	}
+
+	return paramVal, nil
+}
+
+func convertEnumParam[T common.Enum](input map[string]any, paramName string) (T, error) {
+
+	var enumVal T
+
+	enumName, err := getParam[string](input, paramName)
+	if err != nil {
+		return enumVal, err
+	}
+
+	enumInstance, err := enumVal.FromString(enumName)
+	if err != nil {
+		return enumVal, err
+	}
+
+	enumVal, ok := enumInstance.(T)
+	if !ok {
+		return enumVal, fmt.Errorf("the param %s assert error, target type %T, real type: %T", paramName, enumVal, enumInstance)
+	}
+
+	return enumVal, nil
+
 }
 
 // ServerConfig Common server config
