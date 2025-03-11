@@ -12,7 +12,7 @@ import (
 	"github.com/JustACP/criceta/pkg/common/utils"
 )
 
-const ChunkHeadSize uint64 = 128
+const ChunkHeadSize uint64 = 256
 
 type ChunkStatus uint16
 
@@ -22,9 +22,10 @@ const (
 	READING
 	WRITING
 	SYNCING
+	ERROR
 )
 
-var chunkStatusNames = []string{"VALID", "DELETED", "READING", "WRITING", "SYNCING"}
+var chunkStatusNames = []string{"VALID", "DELETED", "READING", "WRITING", "SYNCING", "ERROR"}
 
 func (cs ChunkStatus) String() string {
 	csIdx := int(cs) - 1
@@ -42,7 +43,7 @@ func (cs ChunkStatus) FromString(s string) (common.Enum, error) {
 		}
 	}
 
-	return ChunkStatus(0), fmt.Errorf("invalid log mode")
+	return ChunkStatus(0), fmt.Errorf("invalid chunk status")
 }
 
 type CHOption interface {
@@ -81,15 +82,21 @@ func WithVersion(ver uint64) CHOption {
 	})
 }
 
-func WithPos(pos uint64) CHOption {
+func WithIdx(idx uint64) CHOption {
 	return NewCHOption(func(ch *ChunkHead) {
-		ch.Pos = pos
+		ch.Idx = idx
 	})
 }
 
-func WithOff(off uint64) CHOption {
+func WithRangeOffset(offset uint64) CHOption {
 	return NewCHOption(func(ch *ChunkHead) {
-		ch.Off = off
+		ch.Range.Offset = offset
+	})
+}
+
+func WithRangeSize(size uint64) CHOption {
+	return NewCHOption(func(ch *ChunkHead) {
+		ch.Range.Size = size
 	})
 }
 
@@ -99,16 +106,49 @@ func WithStatus(status ChunkStatus) CHOption {
 	})
 }
 
+func WithWriteIdx(writeIdx uint64) CHOption {
+	return NewCHOption(func(ch *ChunkHead) {
+		ch.WriteIdx = writeIdx
+	})
+}
+
+func WithReadIdx(readIdx uint64) CHOption {
+	return NewCHOption(func(ch *ChunkHead) {
+		ch.ReadIdx = readIdx
+	})
+}
+
+func WithCreatAt(createAt int64) CHOption {
+	return NewCHOption(func(ch *ChunkHead) {
+		ch.CreateAt = createAt
+	})
+}
+
+func WithModifyAt(modifyAt int64) CHOption {
+	return NewCHOption(func(ch *ChunkHead) {
+		ch.ModifyAt = modifyAt
+	})
+}
+
+type ChunkRange struct {
+	Offset uint64 `json:"offset"`
+	Size   uint64 `json:"size"`
+}
+
 type ChunkHead struct {
-	Id      uint64      `json:"ChunkId"`
-	FileId  uint64      `json:"FileId"`
-	CRC     uint32      `json:"CRC"`
-	Hash    *string     `json:"Hash"`
-	Size    uint64      `json:"Size"`
-	Version uint64      `json:"Version"`
-	Pos     uint64      `json:"Pos"` // chunk position in file
-	Off     uint64      `json:"Off"`
-	Status  ChunkStatus `json:"Status"`
+	Id       uint64      `json:"chunk_id"`
+	FileId   uint64      `json:"file_id"`
+	CRC      uint32      `json:"crc"`
+	Hash     *string     `json:"hash"`
+	Size     uint64      `json:"size"`
+	Version  uint64      `json:"version"`
+	Idx      uint64      `json:"idx"` // chunk position in file
+	Range    ChunkRange  `json:"range"`
+	WriteIdx uint64      `json:"write_idx"`
+	ReadIdx  uint64      `json:"read_idx"`
+	CreateAt int64       `json:"create_at"`
+	ModifyAt int64       `json:"modify_at"`
+	Status   ChunkStatus `json:"status"`
 }
 
 func (ch *ChunkHead) SetStatus(newStatus ChunkStatus) {
@@ -123,26 +163,22 @@ func (ch *ChunkHead) ToBinary() ([]byte, error) {
 	copy(chBytes[startIdx:endIdx], []byte(constant.APP_NAME))
 
 	// Chunk Id 8 Bytes
-	startIdx = endIdx
-	endIdx += 8
+	startIdx, endIdx = endIdx, endIdx+8
 	binary.BigEndian.PutUint64(chBytes[startIdx:endIdx], uint64(ch.Id))
 
 	// Chunk FileId 8 Bytes
-	startIdx = endIdx
-	endIdx += 8
+	startIdx, endIdx = endIdx, endIdx+8
 	binary.BigEndian.PutUint64(chBytes[startIdx:endIdx], uint64(ch.FileId))
 
 	// Chunk CRC 4 Bytes
-	startIdx = endIdx
-	endIdx += 4
+	startIdx, endIdx = endIdx, endIdx+4
 
 	if ch.Hash != nil {
 		binary.BigEndian.PutUint32(chBytes[startIdx:endIdx], uint32(ch.CRC))
 	}
 
 	// Chunk Blake3 Hash 32 Bytes
-	startIdx = endIdx
-	endIdx += 32
+	startIdx, endIdx = endIdx, endIdx+32
 	if ch.Hash != nil {
 		hashBytes, err := hex.DecodeString(*ch.Hash)
 		if err != nil {
@@ -153,24 +189,40 @@ func (ch *ChunkHead) ToBinary() ([]byte, error) {
 	}
 
 	// Chunk File Size 8 Bytes
-	startIdx = endIdx
-	endIdx += 8
+	startIdx, endIdx = endIdx, endIdx+8
 	binary.BigEndian.PutUint64(chBytes[startIdx:endIdx], uint64(ch.Size))
 
 	// Chunk Version 8 Bytes
-	startIdx = endIdx
-	endIdx += 8
+	startIdx, endIdx = endIdx, endIdx+8
 	binary.BigEndian.PutUint64(chBytes[startIdx:endIdx], uint64(ch.Version))
 
 	// Chunk Pos 8 Bytes
-	startIdx = endIdx
-	endIdx += 8
-	binary.BigEndian.PutUint64(chBytes[startIdx:endIdx], uint64(ch.Pos))
+	startIdx, endIdx = endIdx, endIdx+8
+	binary.BigEndian.PutUint64(chBytes[startIdx:endIdx], uint64(ch.Idx))
 
-	// Chunk Off 8 Bytes
-	startIdx = endIdx
-	endIdx += 8
-	binary.BigEndian.PutUint64(chBytes[startIdx:endIdx], uint64(ch.Off))
+	// Chunk Offset 8 Bytes
+	startIdx, endIdx = endIdx, endIdx+8
+	binary.BigEndian.PutUint64(chBytes[startIdx:endIdx], uint64(ch.Range.Offset))
+
+	// Chunk Range Size 8 Bytes
+	startIdx, endIdx = endIdx, endIdx+8
+	binary.BigEndian.PutUint64(chBytes[startIdx:endIdx], uint64(ch.Range.Size))
+
+	// Chunk WriteAt 8 Bytes
+	startIdx, endIdx = endIdx, endIdx+8
+	binary.BigEndian.PutUint64(chBytes[startIdx:endIdx], uint64(ch.WriteIdx))
+
+	// Chunk ReadAt 8 Bytes
+	startIdx, endIdx = endIdx, endIdx+8
+	binary.BigEndian.PutUint64(chBytes[startIdx:endIdx], uint64(ch.ReadIdx))
+
+	// Chunk CreateAt 8 Bytes
+	startIdx, endIdx = endIdx, endIdx+8
+	binary.BigEndian.PutUint64(chBytes[startIdx:endIdx], uint64(ch.CreateAt))
+
+	// Chunk ModifyAt 8 Bytes
+	startIdx, endIdx = endIdx, endIdx+8
+	binary.BigEndian.PutUint64(chBytes[startIdx:endIdx], uint64(ch.ModifyAt))
 
 	// Chunk Status 2 Bytes
 	startIdx = endIdx
@@ -199,7 +251,7 @@ func (ch *ChunkHead) FromBinary(input []byte) error {
 	ch.Id = binary.BigEndian.Uint64(input[startIdx:endIdx])
 
 	startIdx, endIdx = endIdx, endIdx+8
-	ch.Id = binary.BigEndian.Uint64(input[startIdx:endIdx])
+	ch.FileId = binary.BigEndian.Uint64(input[startIdx:endIdx])
 
 	startIdx, endIdx = endIdx, endIdx+4
 	ch.CRC = binary.BigEndian.Uint32(input[startIdx:endIdx])
@@ -224,10 +276,25 @@ func (ch *ChunkHead) FromBinary(input []byte) error {
 	ch.Version = binary.BigEndian.Uint64(input[startIdx:endIdx])
 
 	startIdx, endIdx = endIdx, endIdx+8
-	ch.Pos = binary.BigEndian.Uint64(input[startIdx:endIdx])
+	ch.Idx = binary.BigEndian.Uint64(input[startIdx:endIdx])
 
 	startIdx, endIdx = endIdx, endIdx+8
-	ch.Off = binary.BigEndian.Uint64(input[startIdx:endIdx])
+	ch.Range.Offset = binary.BigEndian.Uint64(input[startIdx:endIdx])
+
+	startIdx, endIdx = endIdx, endIdx+8
+	ch.Range.Size = binary.BigEndian.Uint64(input[startIdx:endIdx])
+
+	startIdx, endIdx = endIdx, endIdx+8
+	ch.WriteIdx = binary.BigEndian.Uint64(input[startIdx:endIdx])
+
+	startIdx, endIdx = endIdx, endIdx+8
+	ch.ReadIdx = binary.BigEndian.Uint64(input[startIdx:endIdx])
+
+	startIdx, endIdx = endIdx, endIdx+8
+	ch.CreateAt = int64(binary.BigEndian.Uint64(input[startIdx:endIdx]))
+
+	startIdx, endIdx = endIdx, endIdx+8
+	ch.ModifyAt = int64(binary.BigEndian.Uint64(input[startIdx:endIdx]))
 
 	startIdx, endIdx = endIdx, endIdx+2
 	ch.Status = ChunkStatus(binary.BigEndian.Uint16(input[startIdx:endIdx]))
@@ -240,7 +307,7 @@ func (ch *ChunkHead) Validate() error {
 		return fmt.Errorf("invalid chunk id: %d", ch.Id)
 	}
 
-	if ch.Hash == nil || len(*ch.Hash) != 32 {
+	if ch.Hash == nil {
 		return fmt.Errorf("invalid hash length")
 	}
 
@@ -249,21 +316,4 @@ func (ch *ChunkHead) Validate() error {
 	}
 
 	return nil
-}
-
-// Equal compares two ChunkHead structs
-func (ch *ChunkHead) Equal(other *ChunkHead) bool {
-	if ch == nil || other == nil {
-		return ch == nil && other == nil
-	}
-
-	return ch.Id == other.Id &&
-		ch.FileId == other.FileId &&
-		ch.CRC == other.CRC &&
-		((ch.Hash == nil && other.Hash == nil) ||
-			(ch.Hash != nil && other.Hash != nil && *ch.Hash == *other.Hash)) &&
-		ch.Size == other.Size &&
-		ch.Pos == other.Pos &&
-		ch.Status == other.Status &&
-		ch.Off == other.Off
 }
