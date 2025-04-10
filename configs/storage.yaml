@@ -1,0 +1,31 @@
+# 基础服务器配置（ServerConfig）
+server_id: 2
+server_name: "storage-1"
+server_ip: "localhost"
+port: 8889
+server_type: "STORAGE"
+
+# 日志配置（LogConfig）
+log:
+  mode: "MIX"
+  level: "INFO"
+  file_path: "logs/storage.log"
+
+# Tracker 节点列表（[]*ServerConfig）
+trackers:
+  - server_id: 1
+    server_name: "tracker-1"
+    server_ip: "localhost"
+    port: 8888
+    server_type: "TRACKER"
+
+# Chunk 存储配置（ChunkStorageConfig）
+chunk_storage:
+  file_path: "data/chunks"
+  buffer_size: 4194304  # 4MB
+  max_storage_size: 1073741824  # 1GB
+  integrity_check_interval: 3600  # 1小时
+  recycle_interval: 1800  # 30分钟
+
+# 心跳间隔（秒）
+heartbeat_interval: 10 

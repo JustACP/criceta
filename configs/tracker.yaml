@@ -1,0 +1,29 @@
+# 基础服务器配置
+server_id: 1
+server_name: "tracker-1"
+server_ip: "localhost"
+port: 8888
+server_type: "TRACKER"
+
+# 日志配置
+log:
+  mode: "MIX"
+  level: "INFO"
+  file_path: "logs/tracker.log"
+
+# 集群配置
+cluster_mode: "standalone"
+node_role: "master"
+
+# 可选的 slot range 配置
+slot_range:
+  start: 0
+  end: 1000000
+
+# 可选的集群节点配置（在 standalone 模式下可以省略）
+# cluster_nodes:
+#   - server_id: 2
+#     server_name: "tracker-2"
+#     server_ip: "localhost"
+#     port: 8889
+#     server_type: "TRACKER" 

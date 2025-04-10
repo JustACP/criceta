@@ -82,9 +82,9 @@ func WithVersion(ver uint64) CHOption {
 	})
 }
 
-func WithIdx(idx uint64) CHOption {
+func WithOffset(offset uint64) CHOption {
 	return NewCHOption(func(ch *ChunkHead) {
-		ch.Idx = idx
+		ch.Offset = offset
 	})
 }
 
@@ -142,7 +142,7 @@ type ChunkHead struct {
 	Hash     *string     `json:"hash"`
 	Size     uint64      `json:"size"`
 	Version  uint64      `json:"version"`
-	Idx      uint64      `json:"idx"` // chunk position in file
+	Offset   uint64      `json:"offset"` // chunk offset in file for random access
 	Range    ChunkRange  `json:"range"`
 	WriteIdx uint64      `json:"write_idx"`
 	ReadIdx  uint64      `json:"read_idx"`
@@ -196,11 +196,11 @@ func (ch *ChunkHead) ToBinary() ([]byte, error) {
 	startIdx, endIdx = endIdx, endIdx+8
 	binary.BigEndian.PutUint64(chBytes[startIdx:endIdx], uint64(ch.Version))
 
-	// Chunk Pos 8 Bytes
-	startIdx, endIdx = endIdx, endIdx+8
-	binary.BigEndian.PutUint64(chBytes[startIdx:endIdx], uint64(ch.Idx))
-
 	// Chunk Offset 8 Bytes
+	startIdx, endIdx = endIdx, endIdx+8
+	binary.BigEndian.PutUint64(chBytes[startIdx:endIdx], uint64(ch.Offset))
+
+	// Chunk Range Offset 8 Bytes
 	startIdx, endIdx = endIdx, endIdx+8
 	binary.BigEndian.PutUint64(chBytes[startIdx:endIdx], uint64(ch.Range.Offset))
 
@@ -276,7 +276,7 @@ func (ch *ChunkHead) FromBinary(input []byte) error {
 	ch.Version = binary.BigEndian.Uint64(input[startIdx:endIdx])
 
 	startIdx, endIdx = endIdx, endIdx+8
-	ch.Idx = binary.BigEndian.Uint64(input[startIdx:endIdx])
+	ch.Offset = binary.BigEndian.Uint64(input[startIdx:endIdx])
 
 	startIdx, endIdx = endIdx, endIdx+8
 	ch.Range.Offset = binary.BigEndian.Uint64(input[startIdx:endIdx])

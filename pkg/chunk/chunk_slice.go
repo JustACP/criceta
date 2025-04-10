@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,18 +34,25 @@ type SliceBasedChunk struct {
 var ChunkMetaPath string
 
 func initChunkMetaPath() {
-	instanceConf := config.GetInstanceConfig()
-	conf, ok := interface{}(instanceConf.ServerConfig).(config.StorageNodeConfig)
-	if !ok {
+	conf, err := config.GetRawConfig[config.StorageNodeConfig]()
+
+	if err != nil {
 		panic("current instance config is not storage server")
 	}
 
 	SlicePath = filepath.Join(conf.ChunkStorage.FilePath, "chunk")
+	ChunkMetaPath = filepath.Join(conf.ChunkStorage.FilePath, "meta")
+}
 
+func InitChunkSliceMeta() {
+	initChunkMetaPath()
 }
 
 // NewSliceBasedChunk 创建一个新的基于Slice的Chunk
-func NewSliceBasedChunk(id, fileId, idx uint64, chOptions ...CHOption) (*SliceBasedChunk, error) {
+// id: the new chunk id
+// fileId: the file id of the chunk
+// offset: the offset of the chunk in the file
+func NewSliceBasedChunk(id, fileId, offset uint64, chOptions ...CHOption) (*SliceBasedChunk, error) {
 	// 确保目录存在
 	if err := os.MkdirAll(ChunkMetaPath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create directory: %w", err)
@@ -54,7 +62,7 @@ func NewSliceBasedChunk(id, fileId, idx uint64, chOptions ...CHOption) (*SliceBa
 	ch := &ChunkHead{
 		Id:     id,
 		FileId: fileId,
-		Idx:    idx,
+		Offset: offset,
 	}
 	for _, op := range chOptions {
 		op.apply(ch)
@@ -67,9 +75,6 @@ func NewSliceBasedChunk(id, fileId, idx uint64, chOptions ...CHOption) (*SliceBa
 	}
 	if ch.FileId == 0 {
 		return nil, fmt.Errorf("chunk file id has not been set")
-	}
-	if ch.Idx == 0 {
-		return nil, fmt.Errorf("chunk idx has not been set")
 	}
 
 	if ch.CreateAt == 0 {
@@ -113,14 +118,18 @@ func NewSliceBasedChunk(id, fileId, idx uint64, chOptions ...CHOption) (*SliceBa
 	}, nil
 }
 
-// OpenSliceBasedChunk 打开一个已存在的基于Slice的Chunk
-func OpenSliceBasedChunk(chunkId uint64) (*SliceBasedChunk, error) {
-	// 打开ChunkFile
-	metaFiles, err := filepath.Glob(filepath.Join(ChunkMetaPath, fmt.Sprintf("chunk_*_%d.meta", chunkId)))
+// OpenChunkByPath 通过路径打开所有已存在的基于Slice的Chunk
+func OpenChunkByPath(path string) (*SliceBasedChunk, error) {
+	metaFiles, err := filepath.Glob(path)
 	if len(metaFiles) <= 0 || err != nil || len(metaFiles) > 1 {
 		return nil, fmt.Errorf("open chunk meta info error")
 	}
 
+	pathSplit := strings.Split(path, "_")
+	if len(pathSplit) != 2 {
+		return nil, fmt.Errorf("chunk path is not valid")
+	}
+	chunkId, _ := strconv.ParseUint(pathSplit[1], 10, 64)
 	chunkFilePath := metaFiles[0]
 	chunkFile, err := os.OpenFile(
 		chunkFilePath,
@@ -159,6 +168,16 @@ func OpenSliceBasedChunk(chunkId uint64) (*SliceBasedChunk, error) {
 		Head:         ch,
 		SliceManager: sliceManager,
 	}, nil
+}
+
+// OpenChunk 同OpenSliceBasedChunk
+func OpenChunk(chunkId uint64) (*SliceBasedChunk, error) {
+	return OpenSliceBasedChunk(chunkId)
+}
+
+// OpenSliceBasedChunk 打开一个已存在的基于Slice的Chunk
+func OpenSliceBasedChunk(chunkId uint64) (*SliceBasedChunk, error) {
+	return OpenChunkByPath(filepath.Join(ChunkMetaPath, fmt.Sprintf("chunk_*_%d.meta", chunkId)))
 }
 
 func (sc *SliceBasedChunk) flushHead() error {
@@ -224,9 +243,9 @@ func (sc *SliceBasedChunk) writeAt(p []byte, off int64) (n int, err error) {
 	totalSize := uint64(0)
 	var readErr error
 
-	for off := int64(0); readErr == nil || !strings.EqualFold(readErr.Error(), io.EOF.Error()); off += int64(UpdateSteps) {
+	for readOff := int64(0); readErr == nil || !strings.EqualFold(readErr.Error(), io.EOF.Error()); readOff += int64(UpdateSteps) {
 		var readSize int
-		readSize, readErr = sc.SliceManager.ReadAt(step, off)
+		readSize, readErr = sc.SliceManager.ReadAt(step, readOff)
 		if readErr != nil && !strings.EqualFold(readErr.Error(), io.EOF.Error()) {
 			sc.Head.Status = ERROR
 			return len(p), fmt.Errorf("chunk :%v read slice manger error, err: %v", sc.Head.Id, err.Error())
@@ -366,4 +385,41 @@ func (sc *SliceBasedChunk) Validate() error {
 	}
 
 	return nil
+}
+
+// CalculateCRC 计算 chunk 的 CRC 值
+func (sc *SliceBasedChunk) CalculateCRC() (string, error) {
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+
+	// 重置 CRC
+	oldCRC := sc.Head.CRC
+	sc.Head.CRC = 0
+
+	step := make([]byte, UpdateSteps)
+	var readErr error
+	for off := int64(0); readErr == nil || !strings.EqualFold(readErr.Error(), io.EOF.Error()); off += int64(UpdateSteps) {
+		var n int
+		n, readErr = sc.SliceManager.ReadAt(step, off)
+		if readErr != nil && !strings.EqualFold(readErr.Error(), io.EOF.Error()) {
+			sc.Head.CRC = oldCRC
+			return "", fmt.Errorf("chunk :%v read slice manger error, err: %v", sc.Head.Id, readErr.Error())
+		}
+		sc.Head.CRC = utils.UpdateCRC32(sc.Head.CRC, step[:n])
+	}
+
+	// 将 CRC 转换为字符串
+	crcStr := fmt.Sprintf("%08x", sc.Head.CRC)
+
+	// 恢复原始 CRC
+	sc.Head.CRC = oldCRC
+
+	return crcStr, nil
+}
+
+// GetSliceCount 获取当前 Chunk 的 Slice 数量
+func (sc *SliceBasedChunk) GetSliceCount() int {
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+	return len(sc.SliceManager.Slices)
 }

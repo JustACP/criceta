@@ -155,7 +155,7 @@ func (l *Logger) log(level LogLevel, format string, args ...interface{}) {
 	_, file, line, _ := runtime.Caller(3)
 	logMsg := fmt.Sprintf("[%s][%s][%s:%d]: %s",
 		time.Now().Format("2006:01:02 15:04:05"),
-		levelNames[level],
+		level.String(),
 		filepath.Base(file),
 		line,
 		msg)
