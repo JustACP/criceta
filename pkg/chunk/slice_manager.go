@@ -124,16 +124,25 @@ func (sm *SliceManager) WriteAt(p []byte, off int64) (n int, err error) {
 // writeAt
 func (sm *SliceManager) writeAt(p []byte, off int64) (n int, err error) {
 
-	newSlice, err := sm.createNewSlice(uint64(off))
+	// 使用ID生成器生成新的Slice ID
+	sliceId := idgen.NextID()
+	version := sm.HighestVersion + 1
+
+	// 创建新Slice
+	newSlice, err := NewSlice(sliceId, sm.ChunkId, version, uint64(off))
 	if err != nil {
 		return 0, fmt.Errorf("SliceManger WriteAt err, err: %v", err.Error())
 	}
 
 	err = newSlice.WriteData(p)
 	if err != nil {
+		newSlice.Remove()
 		return 0, fmt.Errorf("SliceManger WriteAt err, err: %v", err.Error())
 	}
 
+	sm.appendSlice(newSlice)
+
+	sm.HighestVersion++
 	return len(p), nil
 }
 
@@ -174,7 +183,7 @@ func (sm *SliceManager) UpdateMapping() {
 
 func (sm *SliceManager) updateMapping() {
 
-	if sm.mappingVer != sm.HighestVersion {
+	if sm.mappingVer != sm.HighestVersion || sm.mappingVer == 0 {
 		validSlice := sm.getActiveSlices()
 		sm.mapping = mergeMapping(validSlice)
 		sm.mappingVer = sm.HighestVersion

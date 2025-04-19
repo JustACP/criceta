@@ -4,8 +4,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
+
+	"github.com/JustACP/criceta/pkg/common/utils"
 
 	"github.com/JustACP/criceta/pkg/common"
 	"github.com/JustACP/criceta/pkg/common/logs"
@@ -43,7 +46,6 @@ func (ic *InstanceConfig) GetConfig() {
 	if err != nil {
 		panic(fmt.Sprintf("read config error, err: %v", err.Error()))
 	}
-
 }
 
 func (ic *InstanceConfig) SaveConfig() error {
@@ -64,58 +66,68 @@ func (ic *InstanceConfig) SaveConfig() error {
 	return nil
 }
 
-const configPath = "/etc/criceta"
+const defaultConfigPath = "/etc/criceta"
 const configName = "config"
 const configType = "yaml"
 
-func newViperReader() *viper.Viper {
-
+func newViperReader(configPaths []string) *viper.Viper {
 	v := viper.New()
-	v.AddConfigPath(configPath)
-	v.SetConfigName(configName)
-	v.SetConfigType(configType)
-
+	for _, path := range configPaths {
+		v.SetConfigFile(path)
+	}
 	return v
 }
 
-func NewInstanceConfig(serverType ServerType) *InstanceConfig {
+func NewInstanceConfig(serverType ServerType, configPaths ...string) *InstanceConfig {
 	instanceConf := &InstanceConfig{}
 
 	switch serverType {
 	case TRACKER:
-		instanceConf.ServerConfig = new(ServerConfig)
-		break
+		instanceConf.ServerConfig = new(TrackerNodeConfig)
 	case STORAGE:
 		instanceConf.ServerConfig = new(StorageNodeConfig)
-		break
 	default:
 		panic("No Server Type")
 	}
 
-	cf, err := os.OpenFile(
-		filepath.Join(configPath, fmt.Sprintf("%s.%s", configName, configType)),
-		os.O_RDWR,
-		0764,
-	)
+	if len(configPaths) == 0 {
+		configPaths = []string{filepath.Join(defaultConfigPath, fmt.Sprintf("%s.%s", configName, configType))}
+	}
 
-	if cf == nil || err != nil {
-		panicMsg := fmt.Sprintf("No config was find, please check config file in : %v", configPath)
+	var cf *os.File
+	var err error
+	var configFile string
+
+	for _, path := range configPaths {
+		if utils.FileExists(path) {
+			cf, err = os.OpenFile(path, os.O_RDWR, 0764)
+			if err == nil {
+				configFile = path
+				break
+			}
+		}
+	}
+
+	if cf == nil {
+		panicMsg := fmt.Sprintf("No config was found, please check config file in: %v", configPaths)
 		panic(panicMsg)
 	}
 
 	instanceConf.cf = cf
+	instanceConf.v = newViperReader([]string{configFile})
 
 	return instanceConf
 }
 
 var (
-	instance *InstanceConfig
-	once     sync.Once
+	instance          *InstanceConfig
+	currentServerType ServerType
+	once              sync.Once
 )
 
-func InitInstanceConfig(serverType ServerType) {
+func InitInstanceConfig(serverType ServerType, configPath ...string) {
 	once.Do(func() {
-		instance := NewInstanceConfig(serverType)
+		instance = NewInstanceConfig(serverType, configPath...)
 		instance.GetConfig()
 	})
 }
@@ -123,6 +135,42 @@ func InitInstanceConfig(serverType ServerType) {
 func GetInstanceConfig() *InstanceConfig {
 
 	return instance
+}
+
+func GetRawConfig[T any]() (*T, error) {
+	instanceConf := GetInstanceConfig()
+	if instanceConf == nil {
+		return nil, fmt.Errorf("failed to get config instance")
+	}
+
+	// 获取 ServerConfig 的实际类型
+	serverConfigType := reflect.TypeOf(instanceConf.ServerConfig)
+	var conf T
+	// 根据 T 的类型进行断言
+	switch any((*T)(nil)).(type) {
+	case *StorageNodeConfig:
+		tmpConf, ok := instanceConf.ServerConfig.(*StorageNodeConfig)
+		if !ok {
+			return nil, fmt.Errorf("failed to get raw config: expected *StorageNodeConfig, got %s", serverConfigType)
+		}
+		conf, ok = interface{}(*tmpConf).(T)
+		if !ok {
+			return nil, fmt.Errorf("failed to convert config to type %T", (*T)(nil))
+		}
+	case *TrackerNodeConfig:
+		tmpConf, ok := instanceConf.ServerConfig.(*TrackerNodeConfig)
+		if !ok {
+			return nil, fmt.Errorf("failed to get raw config: expected *TrackerNodeConfig, got %s", serverConfigType)
+		}
+		conf, ok = interface{}(*tmpConf).(T)
+		if !ok {
+			return nil, fmt.Errorf("failed to convert config to type %T", (*T)(nil))
+		}
+	default:
+		return nil, fmt.Errorf("unsupported type %T", any((*T)(nil)))
+	}
+
+	return &conf, nil
 }
 
 var serverTypeNames = []string{"TRACKER", "STORAGE"}
@@ -181,34 +229,34 @@ type Config interface {
 }
 
 type LogConfig struct {
-	Mode     LogMode       `json:"Mode"`
-	Level    logs.LogLevel `json:"Level"`
-	FilePath *string       `json:"FilePath,omitempty"`
+	Mode     LogMode       `json:"mode"`
+	Level    logs.LogLevel `json:"level"`
+	FilePath *string       `json:"file_path,omitempty"`
 }
 
 func (lc *LogConfig) ReadConfig(input map[string]any) (Config, error) {
 	var err error
 
 	// Read Mode
-	lc.Mode, err = convertEnumParam[LogMode](input, "Mode")
+	lc.Mode, err = convertEnumParam[LogMode](input, "mode")
 	if err != nil {
-		logs.Error("LogConfig read Mode param err, err: %v", err)
+		logs.Error("LogConfig read mode param err, err: %v", err)
 		return nil, err
 	}
 
 	// Read Level
-	lc.Level, err = convertEnumParam[logs.LogLevel](input, "Level")
+	lc.Level, err = convertEnumParam[logs.LogLevel](input, "level")
 	if err != nil {
-		logs.Error("LogConfig read Level param err, err: %v", err)
+		logs.Error("LogConfig read level param err, err: %v", err)
 		return nil, err
 	}
 
 	// Read optional FilePath
 	if lc.Mode == FILE || lc.Mode == MIX {
 		var filePath string
-		filePath, err = getParam[string](input, "FilePath")
+		filePath, err = getParam[string](input, "file_path")
 		if err != nil {
-			logs.Error("LogConfig read FilePath param err, err: %v", err)
+			logs.Error("LogConfig read file_path param err, err: %v", err)
 			return nil, err
 		}
 		lc.FilePath = &filePath
@@ -219,12 +267,12 @@ func (lc *LogConfig) ReadConfig(input map[string]any) (Config, error) {
 
 func (lc *LogConfig) SaveConfig() map[string]any {
 	logOutput := map[string]any{
-		"Mode":  lc.Mode.String(),
-		"Level": lc.Level.String(),
+		"mode":  lc.Mode.String(),
+		"level": lc.Level.String(),
 	}
 
 	if lc != nil {
-		logOutput["FilePath"] = *lc.FilePath
+		logOutput["file_path"] = *lc.FilePath
 	}
 
 	return logOutput
@@ -232,20 +280,40 @@ func (lc *LogConfig) SaveConfig() map[string]any {
 
 // getParam : get param and convert
 func getParam[T any](input map[string]any, paramName string) (T, error) {
-
-	var paramVal T
-
 	val, exists := input[paramName]
 	if !exists {
-		return paramVal, fmt.Errorf("cannot found param %s", paramName)
+		return *new(T), fmt.Errorf("cannot find param %s", paramName)
 	}
 
-	paramVal, ok := val.(T)
-	if !ok {
-		return paramVal, fmt.Errorf("the param %s is not of type %T, real type: %T", paramName, paramVal, val)
+	targetType := reflect.TypeOf(new(T)).Elem()
+	valType := reflect.TypeOf(val)
+	valReflect := reflect.ValueOf(val)
+	// Slice 单独处理
+	if targetType.Kind() == reflect.Slice && valType.Kind() == reflect.Slice {
+		// 创建一个与目标类型相同的切片
+
+		result := reflect.MakeSlice(targetType, valReflect.Len(), valReflect.Cap())
+
+		// 遍历输入的切片
+		for idx := 0; idx < valReflect.Len(); idx++ {
+			// 获取当前元素
+			currVal := reflect.ValueOf(val).Index(idx).Interface()
+			currValType := reflect.TypeOf(currVal)
+			if currValType.ConvertibleTo(targetType.Elem()) {
+				convertedVal := reflect.ValueOf(currVal).Convert(targetType.Elem()).Interface()
+				result.Index(idx).Set(reflect.ValueOf(convertedVal))
+			}
+
+		}
+		return result.Interface().(T), nil
+	}
+	// Check if the value can be converted to the target type
+	if valType.ConvertibleTo(targetType) {
+		convertedVal := reflect.ValueOf(val).Convert(targetType).Interface()
+		return convertedVal.(T), nil
 	}
 
-	return paramVal, nil
+	return *new(T), fmt.Errorf("the param %s is not of type %T, real type: %T", paramName, *new(T), val)
 }
 
 func convertEnumParam[T common.Enum](input map[string]any, paramName string) (T, error) {
@@ -276,39 +344,49 @@ func convertEnumParam[T common.Enum](input map[string]any, paramName string) (T,
 // ServerIP you have to configure it only when you to connect another server or connect to cluster.
 // Port local service network port.
 type ServerConfig struct {
-	ServerId   int64      `json:"ServerId"`
-	ServerName *string    `json:"ServerName,omitempty"`
-	ServerIP   *string    `json:"ServerIP,omitempty"`
-	Port       int32      `json:"Port"`
-	ServerType ServerType `json:"ServerType"`
+	ServerId       int64      `json:"server_id"`
+	ServerName     *string    `json:"server_name,omitempty"`
+	ServerIP       *string    `json:"server_ip,omitempty"`
+	Port           int32      `json:"port"`                       // RPC POrt
+	RaftPort       *int32     `json:"raft_port, omitempty"`       // Raft Port
+	MemberlistPort *int32     `json:"memberlist_port, omitempty"` // memberlist port
+	ServerType     ServerType `json:"server_type"`
 }
 
 func (sc *ServerConfig) ReadConfig(input map[string]any) (Config, error) {
 	var err error
 
-	sc.ServerId, err = getParam[int64](input, "ServerId")
+	sc.ServerId, err = getParam[int64](input, "server_id")
 	if err != nil {
-		logs.Error("ServerConfig read ServerId param err, err: %v", err)
+		logs.Error("ServerConfig read server_id param err, err: %v", err)
 		return nil, err
 	}
 
 	var serverName string
-	serverName, _ = getParam[string](input, "ServerName")
+	serverName, _ = getParam[string](input, "server_name")
 	sc.ServerName = &serverName
 
 	var serverIP string
-	serverIP, _ = getParam[string](input, "ServerIP")
+	serverIP, _ = getParam[string](input, "server_ip")
 	sc.ServerIP = &serverIP
 
-	sc.Port, err = getParam[int32](input, "Port")
+	sc.Port, err = getParam[int32](input, "port")
 	if err != nil {
-		logs.Error("ServerConfig read Port param err, err: %v", err)
+		logs.Error("ServerConfig read port param err, err: %v", err)
 		return nil, err
 	}
 
-	sc.ServerType, err = convertEnumParam[ServerType](input, "ServerType")
+	var raftPort int32
+	raftPort, _ = getParam[int32](input, "raft_port")
+	sc.RaftPort = &raftPort
+
+	var memberlistPort int32
+	memberlistPort, _ = getParam[int32](input, "memberlist_port")
+	sc.MemberlistPort = &memberlistPort
+
+	sc.ServerType, err = convertEnumParam[ServerType](input, "server_type")
 	if err != nil {
-		logs.Error("ServerConfig read ServerTyep param err, err: %v", err)
+		logs.Error("ServerConfig read server_type param err, err: %v", err)
 		return nil, err
 	}
 
@@ -317,204 +395,17 @@ func (sc *ServerConfig) ReadConfig(input map[string]any) (Config, error) {
 
 func (sc *ServerConfig) SaveConfig() map[string]any {
 	config := map[string]any{
-		"ServerId":   sc.ServerId,
-		"Port":       sc.Port,
-		"ServerType": sc.ServerType.String(),
+		"server_id":   sc.ServerId,
+		"port":        sc.Port,
+		"server_type": sc.ServerType.String(),
 	}
 
 	if sc.ServerName != nil {
-		config["ServerName"] = *sc.ServerName
+		config["server_name"] = *sc.ServerName
 	}
 	if sc.ServerIP != nil {
-		config["ServerIP"] = *sc.ServerIP
+		config["server_ip"] = *sc.ServerIP
 	}
 
 	return config
-}
-
-// ChunkStorageConfig Storage Node Save File Config
-// FilePath is the path where the chunk files save.
-// MaxStorageSize is the storage node max storage size.
-// IntegrityCheckInterval How often to perform an integrity check.
-// RecycleInterval How often to recovery orphan chunk files.
-type ChunkStorageConfig struct {
-	FilePath               string `json:"FilePath"`
-	BufferSize             int64  `json:"BufferSize"`             // Bytes
-	MaxStorageSize         *int64 `json:"MaxStorageUsage"`        // KBytes
-	IntegrityCheckInterval int64  `json:"IntegrityCheckInterval"` // seconds
-	RecycleInterval        int64  `json:"RecycleInterval"`        // seconds
-}
-
-func (csc *ChunkStorageConfig) SaveConfig() map[string]any {
-	output := map[string]any{
-		"FilePath":               csc.FilePath,
-		"BufferSize":             csc.BufferSize,
-		"IntegrityCheckInterval": csc.IntegrityCheckInterval,
-		"RecycleInterval":        csc.RecycleInterval,
-	}
-
-	if csc.MaxStorageSize != nil {
-		output["MaxStorageUsage"] = *csc.MaxStorageSize
-	}
-
-	return output
-}
-
-func (csc *ChunkStorageConfig) ReadConfig(input map[string]any) (Config, error) {
-	var err error
-
-	// Required fields
-	csc.FilePath, err = getParam[string](input, "FilePath")
-	if err != nil {
-		err = fmt.Errorf("read FilePath error: %v", err)
-		logs.Error("%s", err.Error())
-		return nil, err
-	}
-
-	csc.BufferSize, err = getParam[int64](input, "BufferSize")
-	if err != nil {
-		err = fmt.Errorf("read BufferSize error: %v", err)
-		logs.Error("%s", err.Error())
-		return nil, err
-	}
-
-	csc.IntegrityCheckInterval, err = getParam[int64](input, "IntegrityCheckInterval")
-	if err != nil {
-		err = fmt.Errorf("read IntegrityCheckInterval error: %v", err)
-		logs.Error("%s", err.Error())
-		return nil, err
-	}
-
-	csc.RecycleInterval, err = getParam[int64](input, "RecycleInterval")
-	if err != nil {
-		err = fmt.Errorf("read RecycleInterval error: %v", err)
-		logs.Error("%s", err.Error())
-		return nil, err
-	}
-
-	// Optional field
-	if maxStorageSize, err := getParam[int64](input, "MaxStorageUsage"); err == nil {
-		csc.MaxStorageSize = &maxStorageSize
-	}
-
-	return csc, nil
-}
-
-// StorageNodeConfig Storage server boot config.
-// Trackers the trackers list in your cluster.
-// HeartbeatInterval how often to send a heartbeat signal.
-type StorageNodeConfig struct {
-	*ServerConfig
-	Log               *LogConfig          `json:"Log"`
-	Trackers          []*ServerConfig     `json:"Trackers"`
-	ChunkStorage      *ChunkStorageConfig `json:"ChunkStorage"`
-	HeartbeatInterval int64               `json:"HeartbeatInterval"` // seconds
-}
-
-func (snc *StorageNodeConfig) SaveConfig() map[string]any {
-	output := snc.ServerConfig.SaveConfig()
-
-	trackersOutput := make([]map[string]any, len(snc.Trackers))
-	for idx, currTracker := range snc.Trackers {
-		trackersOutput[idx] = currTracker.SaveConfig()
-	}
-
-	output["Trackers"] = trackersOutput
-
-	output["Log"] = snc.Log.SaveConfig()
-
-	output["ChunkStorage"] = snc.ChunkStorage.SaveConfig()
-
-	output["HeartbeatInterval"] = snc.HeartbeatInterval
-
-	return output
-}
-
-func (snc *StorageNodeConfig) readTrackersConfig(input map[string]any) (Config, error) {
-
-	trackersInput, err := getParam[[]map[string]any](input, "Trackers")
-	if err != nil {
-		return nil, fmt.Errorf("trackers config doesn't exist")
-	}
-
-	snc.Trackers = make([]*ServerConfig, 0, len(trackersInput))
-	for _, currTrackerInput := range trackersInput {
-		tracker := new(ServerConfig)
-		_, err := tracker.ReadConfig(currTrackerInput)
-		if err != nil {
-			return nil, fmt.Errorf("convert tracker config err, err: %s", err.Error())
-		}
-
-		if tracker.ServerIP == nil {
-			return nil, fmt.Errorf("tracker config lacks ServerIP parameter")
-		}
-		snc.Trackers = append(snc.Trackers, tracker)
-	}
-
-	return snc, nil
-
-}
-
-func (snc *StorageNodeConfig) ReadConfig(input map[string]any) (Config, error) {
-	var err error
-
-	if snc.ServerConfig == nil {
-		snc.ServerConfig = new(ServerConfig)
-	}
-	_, err = snc.ServerConfig.ReadConfig(input)
-	if err != nil {
-		err = fmt.Errorf("storage Node Config read server config err, err: %s", err.Error())
-		logs.Error("%s", err.Error())
-		return nil, err
-	}
-
-	logInput, err := getParam[map[string]any](input, "Log")
-	if err != nil {
-		err = fmt.Errorf("storage Node Config read Log config err, err: %s", err.Error())
-		logs.Error("%s", err.Error())
-		return nil, err
-	}
-
-	if snc.Log == nil {
-		snc.Log = new(LogConfig)
-	}
-	_, err = snc.Log.ReadConfig(logInput)
-	if err != nil {
-		err = fmt.Errorf("storage Node Config read Log config err, err: %s", err.Error())
-		logs.Error("%s", err.Error())
-		return nil, err
-	}
-
-	_, err = snc.readTrackersConfig(input)
-	if err != nil {
-		err = fmt.Errorf("storage Node Config read Trackers config err, err: %s", err.Error())
-		logs.Error("%s", err.Error())
-		return nil, err
-	}
-
-	chunkStorageInput, err := getParam[map[string]any](input, "ChunkStorage")
-	if err != nil {
-		err = fmt.Errorf("storage Node Config read Chunk Storage config err, err: %s", err.Error())
-		logs.Error("%s", err.Error())
-		return nil, err
-	}
-
-	if snc.ChunkStorage == nil {
-		snc.ChunkStorage = new(ChunkStorageConfig)
-	}
-	_, err = snc.ChunkStorage.ReadConfig(chunkStorageInput)
-	if err != nil {
-		err = fmt.Errorf("storage Node Config read Chunk Storage config err, err: %s", err.Error())
-		logs.Error("%s", err.Error())
-		return nil, err
-	}
-
-	snc.HeartbeatInterval, err = getParam[int64](input, "HeartbeatInterval")
-	if err != nil {
-		err = fmt.Errorf("storage Node Config read Hertbeat Interval err, err: %v", err.Error())
-		logs.Error("%s", err.Error())
-		return nil, err
-	}
-
-	return snc, nil
 }

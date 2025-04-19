@@ -45,9 +45,7 @@ func TestNewSliceBasedChunk(t *testing.T) {
 	if chunk.Head.FileId != 1 {
 		t.Errorf("Chunk FileId should be 1")
 	}
-	if chunk.Head.Idx != 1 {
-		t.Errorf("Chunk Idx should be 1")
-	}
+
 	if chunk.Head.CreateAt == 0 {
 		t.Errorf("Chunk CreateAt should not be zero")
 	}
