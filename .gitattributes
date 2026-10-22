@@ -1,0 +1,17 @@
+# Normalize line endings for every text file.
+* text=auto eol=lf
+
+# Ensure these are always treated as text.
+*.go     text eol=lf
+*.mod    text eol=lf
+*.sum    text eol=lf
+*.thrift text eol=lf
+*.yaml   text eol=lf
+*.yml    text eol=lf
+*.md     text eol=lf
+*.sh     text eol=lf
+
+# Binary assets.
+*.png binary
+*.jpg binary
+*.gif binary

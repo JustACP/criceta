@@ -26,20 +26,40 @@ import (
 )
 
 type TrackerNode struct {
-	nodeId       int64
-	files        map[uint64]*meta.FileMeta
-	nodes        map[uint64]*tracker.NodeInfo
-	fileMux      sync.RWMutex
-	nodeMux      sync.RWMutex
-	writeLock    map[uint64]uint64 // fileId -> clientId
-	lockMux      sync.RWMutex
-	raftState    *RaftState
-	heartbeatLog *HeartbeatRecorder
+	nodeId          int64
+	files           map[uint64]*meta.FileMeta
+	nodes           map[uint64]*tracker.NodeInfo
+	fileMux         sync.RWMutex
+	nodeMux         sync.RWMutex
+	writeLock       map[uint64]*fileWriteLease // fileId -> 写租约
+	lockMux         sync.RWMutex
+	raftState       *RaftState
+	heartbeatLog    *HeartbeatRecorder
+	healthCheckOnce sync.Once
 }
 
-func NewTrackerNode() *TrackerNode {
+// fileWriteLease 文件写租约。
+// 租约带过期时间：客户端崩溃后文件会自动解锁，不会被永久占用。
+type fileWriteLease struct {
+	clientId uint64
+	expireAt time.Time
+}
 
-	heartbeatLog, err := NewHeartbeatRecorder("", 0)
+// writeLeaseTTL 写租约有效期：客户端崩溃后最多这么久文件即可被其他客户端接管
+const writeLeaseTTL = 30 * time.Second
+
+func NewTrackerNode() *TrackerNode {
+	return newTrackerNode(defaultHeartbeatDir)
+}
+
+// NewTrackerNodeWithDataDir 使用指定的数据目录创建 Tracker（测试用，避免污染工作区）
+func NewTrackerNodeWithDataDir(dataDir string) *TrackerNode {
+	return newTrackerNode(dataDir)
+}
+
+func newTrackerNode(heartbeatDir string) *TrackerNode {
+
+	heartbeatLog, err := NewHeartbeatRecorder(heartbeatDir, 0)
 	if err != nil {
 		logs.Error("Failed to create heartbeat recorder: %v", err)
 		return nil
@@ -48,11 +68,95 @@ func NewTrackerNode() *TrackerNode {
 	node := &TrackerNode{
 		files:        make(map[uint64]*meta.FileMeta),
 		nodes:        make(map[uint64]*tracker.NodeInfo),
-		writeLock:    make(map[uint64]uint64),
+		writeLock:    make(map[uint64]*fileWriteLease),
 		heartbeatLog: heartbeatLog,
 	}
 	node.initRaft()
 	return node
+}
+
+// SetNodeID 设置本 Tracker 节点 ID（用于 Raft 投票身份）
+func (t *TrackerNode) SetNodeID(nodeId int64) {
+	t.nodeId = nodeId
+}
+
+// acquireWriteLease 获取（或续期）文件写租约。
+// 同一客户端重复获取视为续期；其他客户端持有未过期租约时返回锁冲突。
+func (t *TrackerNode) acquireWriteLease(fileId, clientId uint64) error {
+	t.lockMux.Lock()
+	defer t.lockMux.Unlock()
+
+	now := time.Now()
+	if lease, ok := t.writeLock[fileId]; ok {
+		if lease.clientId != clientId && now.Before(lease.expireAt) {
+			return fmt.Errorf("file is locked by other client")
+		}
+	}
+
+	t.writeLock[fileId] = &fileWriteLease{
+		clientId: clientId,
+		expireAt: now.Add(writeLeaseTTL),
+	}
+	return nil
+}
+
+// renewWriteLease 续期租约；若租约已不属于该客户端返回 false
+func (t *TrackerNode) renewWriteLease(fileId, clientId uint64) bool {
+	t.lockMux.Lock()
+	defer t.lockMux.Unlock()
+
+	lease, ok := t.writeLock[fileId]
+	if !ok || lease.clientId != clientId {
+		return false
+	}
+	lease.expireAt = time.Now().Add(writeLeaseTTL)
+	return true
+}
+
+// checkWriteLease 仅检查文件是否被其他客户端以未过期租约占用
+func (t *TrackerNode) checkWriteLease(fileId, clientId uint64) error {
+	t.lockMux.RLock()
+	defer t.lockMux.RUnlock()
+
+	lease, ok := t.writeLock[fileId]
+	if !ok {
+		return nil
+	}
+	if lease.clientId != clientId && time.Now().Before(lease.expireAt) {
+		return fmt.Errorf("file is locked by other client")
+	}
+	return nil
+}
+
+// releaseWriteLease 释放租约。
+// 文件本来就没有锁、或锁已过期时视为成功（幂等）。
+func (t *TrackerNode) releaseWriteLease(fileId, clientId uint64) error {
+	t.lockMux.Lock()
+	defer t.lockMux.Unlock()
+
+	lease, ok := t.writeLock[fileId]
+	if !ok {
+		return nil
+	}
+	if lease.clientId != clientId && time.Now().Before(lease.expireAt) {
+		return fmt.Errorf("file is locked by other client")
+	}
+	delete(t.writeLock, fileId)
+	return nil
+}
+
+// cleanupExpiredLeases 清理过期写租约
+func (t *TrackerNode) cleanupExpiredLeases() {
+	t.lockMux.Lock()
+	defer t.lockMux.Unlock()
+
+	now := time.Now()
+	for fileId, lease := range t.writeLock {
+		if now.After(lease.expireAt) {
+			logs.Warn("Write lease of file %d (client %d) expired, releasing", fileId, lease.clientId)
+			delete(t.writeLock, fileId)
+		}
+	}
 }
 
 func (t *TrackerNode) CreateFile(ctx context.Context, req *tracker.CreateFileRequest) (*tracker.CreateFileResponse, error) {
@@ -118,15 +222,11 @@ func (t *TrackerNode) AllocateChunk(ctx context.Context, req *tracker.AllocateCh
 		return nil, fmt.Errorf("file not found: %d", req.FileId)
 	}
 
-	// 检查写锁
-	t.lockMux.Lock()
-	if clientId, locked := t.writeLock[uint64(req.FileId)]; locked && clientId != uint64(req.Base.RequestId) {
-		t.lockMux.Unlock()
-		logs.Error("AllocateChunk failed: file is locked by client %d", clientId)
-		return nil, fmt.Errorf("file is locked by other client")
+	// 检查写锁（带租约，客户端崩溃后自动过期）
+	if err := t.acquireWriteLease(uint64(req.FileId), requestClientId(req.Base)); err != nil {
+		logs.Error("AllocateChunk failed: file %d is locked: %v", req.FileId, err)
+		return nil, err
 	}
-	t.writeLock[uint64(req.FileId)] = uint64(req.Base.RequestId)
-	t.lockMux.Unlock()
 
 	// 选择存储节点
 	t.nodeMux.RLock()
@@ -171,12 +271,30 @@ func (t *TrackerNode) AllocateChunk(ctx context.Context, req *tracker.AllocateCh
 }
 
 func (t *TrackerNode) CommitChunk(ctx context.Context, req *tracker.CommitChunkRequest) (*tracker.CommitChunkResponse, error) {
+	if req.Chunk == nil {
+		return nil, fmt.Errorf("commit chunk: chunk meta is nil")
+	}
+	// 这些字段是存储节点写入后必须回传的权威元数据，缺任何一个都说明请求非法
+	if req.Chunk.Crc == nil || req.Chunk.Version == nil || req.Chunk.NodeId == nil ||
+		req.Chunk.CreateAt == nil || req.Chunk.ModifyAt == nil {
+		return nil, fmt.Errorf("commit chunk: incomplete chunk meta")
+	}
+
 	t.fileMux.Lock()
 	defer t.fileMux.Unlock()
 
 	file, ok := t.files[uint64(req.Chunk.FileId)]
 	if !ok {
 		return nil, fmt.Errorf("file not found: %d", req.Chunk.FileId)
+	}
+
+	// 续期写租约；若租约已被其他客户端接管，拒绝提交，避免两个客户端交错写同一文件
+	commitClientId := requestClientId(req.Base)
+	if !t.renewWriteLease(uint64(req.Chunk.FileId), commitClientId) {
+		if err := t.acquireWriteLease(uint64(req.Chunk.FileId), commitClientId); err != nil {
+			logs.Error("CommitChunk failed: file %d is locked: %v", req.Chunk.FileId, err)
+			return nil, err
+		}
 	}
 
 	chunkId := uint64(req.Chunk.Id)
@@ -241,76 +359,43 @@ func (t *TrackerNode) CommitChunk(ctx context.Context, req *tracker.CommitChunkR
 	file.Version++
 	t.files[uint64(req.Chunk.FileId)] = file
 
-	// 选择副本节点
-	// TODO 后续根据节点负载选择
-	replicas := make([]*base.ReplicaInfo, 0)
+	// 选择副本节点（当前策略：取在线节点中最靠前的若干个）
+	// TODO 后续根据节点负载/网络拓扑选择
+	sourceNodeId := *req.Chunk.NodeId
+	replicas := make([]*base.ReplicaInfo, 0, minReplicaCount)
+
+	t.nodeMux.RLock()
+	sourceNode, sourceExists := t.nodes[uint64(sourceNodeId)]
 	for _, node := range t.nodes {
-		if node.NodeId == *req.Chunk.NodeId || node.Status != base.NodeStatus_ONLINE {
+		if node.NodeId == sourceNodeId || node.Status != base.NodeStatus_ONLINE {
 			continue
 		}
 		replicas = append(replicas, &base.ReplicaInfo{
 			NodeId: node.NodeId,
 			Status: int32(base.ChunkStatus_SYNCING),
 		})
-		if len(replicas) >= 2 {
+		if len(replicas) >= minReplicaCount {
 			break
 		}
 	}
+	t.nodeMux.RUnlock()
+
 	file.ChunkReplicas[chunkId] = replicas
 
-	// 异步触发副本同步
-	// TODO 抽出来吧，这里让Commit逻辑太重了
-	for _, replica := range replicas {
-		go func(replicaNodeId int64) {
+	if len(replicas) < minReplicaCount {
+		logs.Warn("Chunk %d of file %d only got %d replica target(s), want %d",
+			chunkId, req.Chunk.FileId, len(replicas), minReplicaCount)
+	}
 
-			sourceNode, ok := t.nodes[uint64(*req.Chunk.NodeId)]
-			if !ok {
-				logs.Error("Source node not found: %d", *req.Chunk.NodeId)
-				return
-			}
-			targetNode, ok := t.nodes[uint64(replicaNodeId)]
-			if !ok {
-				logs.Error("Target node not found: %d", replicaNodeId)
-				return
-			}
-
-			syncReq := &storage.SyncChunkRequest{
-				Base: &base.BaseRequest{
-					RequestId: time.Now().UnixNano(),
-					Timestamp: time.Now().UnixNano(),
-				},
-				Meta: req.Chunk,
-				SourceNode: &storage.NodeInfo{
-					NodeId:  sourceNode.NodeId,
-					Address: sourceNode.Address,
-				},
-			}
-
-			targetClient, err := storageservice.NewClient(
-				fmt.Sprintf("storage-%d", targetNode.NodeId),
-				client.WithHostPorts(targetNode.Address),
-			)
-			if err != nil {
-				logs.Error("Failed to create storage client for node %d: %v", replicaNodeId, err)
-				return
-			}
-
-			syncCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			defer cancel()
-
-			syncResp, err := targetClient.SyncChunk(syncCtx, syncReq)
-			if err != nil {
-				logs.Error("Failed to sync chunk %d to node %d: %v", chunkId, replicaNodeId, err)
-				return
-			}
-
-			if syncResp.Base.Code != 0 {
-				logs.Error("Failed to sync chunk %d to node %d: %s", chunkId, replicaNodeId, syncResp.Base.Message)
-				return
-			}
-
-			logs.Info("Successfully synced chunk %d to node %d", chunkId, replicaNodeId)
-		}(replica.NodeId)
+	// 异步触发副本同步：Tracker 只下发元数据 + 源节点地址，
+	// 由目标节点主动回源拉取整块数据（拉模式）。
+	if sourceExists {
+		for _, replica := range replicas {
+			metaCopy := *req.Chunk
+			go t.syncReplica(&metaCopy, sourceNode, replica)
+		}
+	} else {
+		logs.Error("Source node %d not found, skip replica sync of chunk %d", sourceNodeId, chunkId)
 	}
 
 	return &tracker.CommitChunkResponse{
@@ -321,6 +406,94 @@ func (t *TrackerNode) CommitChunk(ctx context.Context, req *tracker.CommitChunkR
 		Chunk:    req.Chunk,
 		Replicas: replicas,
 	}, nil
+}
+
+// syncReplica 让目标节点从源节点拉取 Chunk 数据，并把结果回写到 ChunkReplicas。
+func (t *TrackerNode) syncReplica(chunkMeta *storage.ChunkMeta, sourceNode *tracker.NodeInfo, replica *base.ReplicaInfo) {
+	chunkId := chunkMeta.Id
+
+	targetNode := t.getNode(uint64(replica.NodeId))
+	if targetNode == nil {
+		logs.Error("Target node %d not found, skip replica sync of chunk %d", replica.NodeId, chunkId)
+		t.setChunkReplicaStatus(chunkMeta.FileId, chunkId, replica.NodeId, base.ChunkStatus_ERROR)
+		return
+	}
+
+	targetClient, err := storageservice.NewClient(
+		fmt.Sprintf("storage-%d", targetNode.NodeId),
+		client.WithHostPorts(targetNode.Address),
+		client.WithRPCTimeout(replicaSyncTimeout),
+	)
+	if err != nil {
+		logs.Error("Failed to create storage client for node %d: %v", replica.NodeId, err)
+		t.setChunkReplicaStatus(chunkMeta.FileId, chunkId, replica.NodeId, base.ChunkStatus_ERROR)
+		return
+	}
+
+	syncCtx, cancel := context.WithTimeout(context.Background(), replicaSyncTimeout)
+	defer cancel()
+
+	syncResp, err := targetClient.SyncChunk(syncCtx, &storage.SyncChunkRequest{
+		Base: &base.BaseRequest{
+			RequestId: time.Now().UnixNano(),
+			Timestamp: time.Now().UnixNano(),
+		},
+		Meta: chunkMeta,
+		SourceNode: &storage.NodeInfo{
+			NodeId:  sourceNode.NodeId,
+			Address: sourceNode.Address,
+		},
+	})
+	if err != nil {
+		logs.Error("Failed to sync chunk %d to node %d: %v", chunkId, replica.NodeId, err)
+		t.setChunkReplicaStatus(chunkMeta.FileId, chunkId, replica.NodeId, base.ChunkStatus_ERROR)
+		return
+	}
+
+	if syncResp.Base == nil || syncResp.Base.Code != base.SUCCESS {
+		msg := "unknown error"
+		if syncResp.Base != nil {
+			msg = syncResp.Base.Message
+		}
+		logs.Error("Failed to sync chunk %d to node %d: %s", chunkId, replica.NodeId, msg)
+		t.setChunkReplicaStatus(chunkMeta.FileId, chunkId, replica.NodeId, base.ChunkStatus_ERROR)
+		return
+	}
+
+	t.setChunkReplicaStatus(chunkMeta.FileId, chunkId, replica.NodeId, base.ChunkStatus_VALID)
+	logs.Info("Replica of chunk %d synced to node %d", chunkId, replica.NodeId)
+}
+
+// setChunkReplicaStatus 更新 Chunk 某个副本的状态
+func (t *TrackerNode) setChunkReplicaStatus(fileId, chunkId, nodeId int64, status base.ChunkStatus) {
+	t.fileMux.Lock()
+	defer t.fileMux.Unlock()
+
+	file, ok := t.files[uint64(fileId)]
+	if !ok {
+		return
+	}
+
+	for _, replica := range file.ChunkReplicas[uint64(chunkId)] {
+		if replica.NodeId == nodeId {
+			replica.Status = int32(status)
+			return
+		}
+	}
+}
+
+// getNode 返回节点快照；不存在时返回 nil
+func (t *TrackerNode) getNode(nodeId uint64) *tracker.NodeInfo {
+	t.nodeMux.RLock()
+	defer t.nodeMux.RUnlock()
+
+	node, ok := t.nodes[nodeId]
+	if !ok {
+		return nil
+	}
+
+	copied := *node
+	return &copied
 }
 
 func (t *TrackerNode) GetFile(ctx context.Context, req *tracker.GetFileRequest) (*tracker.GetFileResponse, error) {
@@ -348,22 +521,38 @@ func (t *TrackerNode) GetFile(ctx context.Context, req *tracker.GetFileRequest) 
 		}
 	}
 
+	chunkReplicas := make(map[int64][]*base.ReplicaInfo, len(fileMeta.ChunkReplicas))
+	for chunkId, replicas := range fileMeta.ChunkReplicas {
+		converted := make([]*base.ReplicaInfo, 0, len(replicas))
+		for _, replica := range replicas {
+			converted = append(converted, &base.ReplicaInfo{
+				NodeId:   replica.NodeId,
+				Status:   replica.Status,
+				SyncTime: replica.SyncTime,
+				Crc:      replica.Crc,
+			})
+		}
+		chunkReplicas[int64(chunkId)] = converted
+	}
+
 	return &tracker.GetFileResponse{
 		Base: &base.BaseResponse{
 			Code:    0,
 			Message: "success",
 		},
 		Meta: &tracker.FileMeta{
-			Id:         fileMeta.Id,
-			Name:       fileMeta.Name,
-			Length:     int64(fileMeta.Length),
-			Status:     base.FileStatus(fileMeta.Status),
-			Size:       fileMeta.Size,
-			Version:    int64(fileMeta.Version),
-			CreateAt:   fileMeta.CreatAt,
-			UpdateAt:   fileMeta.UpdateAt,
-			ModifyTime: fileMeta.ModifyTime,
-			Chunks:     chunks,
+			Id:            fileMeta.Id,
+			Name:          fileMeta.Name,
+			Length:        int64(fileMeta.Length),
+			Status:        base.FileStatus(fileMeta.Status),
+			Size:          fileMeta.Size,
+			Version:       int64(fileMeta.Version),
+			CreateAt:      fileMeta.CreatAt,
+			UpdateAt:      fileMeta.UpdateAt,
+			ModifyTime:    fileMeta.ModifyTime,
+			Chunks:        chunks,
+			LockInfo:      convertLockInfoToThrift(fileMeta.LockInfo),
+			ChunkReplicas: chunkReplicas,
 		},
 	}, nil
 }
@@ -371,23 +560,32 @@ func (t *TrackerNode) GetFile(ctx context.Context, req *tracker.GetFileRequest) 
 const (
 	nodeHeartbeatTimeout = 30 * time.Second
 	nodeCleanupInterval  = 10 * time.Second
+
+	// minReplicaCount 设计文档要求的最小副本数
+	minReplicaCount = 2
+	// replicaSyncTimeout 单次副本同步的总超时
+	replicaSyncTimeout = 5 * time.Minute
 )
 
 func (t *TrackerNode) Init() error {
-
-	go t.StartNodeHealthCheck()
+	t.StartNodeHealthCheck()
 	return nil
 }
 
+// StartNodeHealthCheck 启动节点健康检查与租约清理协程。
+// 使用 sync.Once 保证重复调用（如 main 里再调一次）不会启动多个清理协程。
 func (t *TrackerNode) StartNodeHealthCheck() {
-	go func() {
-		ticker := time.NewTicker(nodeCleanupInterval)
-		defer ticker.Stop()
+	t.healthCheckOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(nodeCleanupInterval)
+			defer ticker.Stop()
 
-		for range ticker.C {
-			t.cleanupInactiveNodes()
-		}
-	}()
+			for range ticker.C {
+				t.cleanupInactiveNodes()
+				t.cleanupExpiredLeases()
+			}
+		}()
+	})
 }
 
 func (t *TrackerNode) cleanupInactiveNodes() {
@@ -438,18 +636,19 @@ func (t *TrackerNode) DeleteFile(ctx context.Context, req *tracker.DeleteFileReq
 		return nil, fmt.Errorf("file not found: %d", req.FileId)
 	}
 
-	t.lockMux.RLock()
-	if clientId, locked := t.writeLock[uint64(req.FileId)]; locked && clientId != uint64(req.Base.RequestId) {
-		t.lockMux.RUnlock()
-		logs.Error("DeleteFile failed: file is locked by client %d", clientId)
-		return nil, fmt.Errorf("file is locked by other client")
+	if err := t.checkWriteLease(uint64(req.FileId), requestClientId(req.Base)); err != nil {
+		logs.Error("DeleteFile failed: file %d is locked: %v", req.FileId, err)
+		return nil, err
 	}
-	t.lockMux.RUnlock()
 
 	fileMeta.Status = meta.DELETED
 	fileMeta.UpdateAt = time.Now().UnixNano()
 
 	delete(t.files, uint64(req.FileId))
+	// 删除成功后释放租约，避免死锁残留
+	if err := t.releaseWriteLease(uint64(req.FileId), requestClientId(req.Base)); err != nil {
+		logs.Warn("DeleteFile: release lease of file %d failed: %v", req.FileId, err)
+	}
 
 	logs.Info("File deleted successfully: id=%d, name=%s", req.FileId, fileMeta.Name)
 
@@ -462,26 +661,10 @@ func (t *TrackerNode) DeleteFile(ctx context.Context, req *tracker.DeleteFileReq
 }
 
 func (t *TrackerNode) UnlockFile(ctx context.Context, req *tracker.UnlockFileRequest) (*tracker.UnlockFileResponse, error) {
-	t.lockMux.Lock()
-	defer t.lockMux.Unlock()
-
-	clientId, locked := t.writeLock[uint64(req.FileId)]
-	if !locked {
-		logs.Warn("UnlockFile: file is not locked: %d", req.FileId)
-		return &tracker.UnlockFileResponse{
-			Base: &base.BaseResponse{
-				Code:    0,
-				Message: "success",
-			},
-		}, nil
+	if err := t.releaseWriteLease(uint64(req.FileId), requestClientId(req.Base)); err != nil {
+		logs.Error("UnlockFile failed: file %d: %v", req.FileId, err)
+		return nil, err
 	}
-
-	if clientId != uint64(req.Base.RequestId) {
-		logs.Error("UnlockFile failed: file is locked by other client: %d", clientId)
-		return nil, fmt.Errorf("file is locked by other client")
-	}
-
-	delete(t.writeLock, uint64(req.FileId))
 
 	logs.Info("File unlocked successfully: id=%d", req.FileId)
 
@@ -615,39 +798,40 @@ func (t *TrackerNode) Heartbeat(ctx context.Context, req *tracker.HeartbeatReque
 
 // AcquireLock 获取文件锁
 func (t *TrackerNode) AcquireLock(ctx context.Context, req *tracker.AcquireLockRequest) (*tracker.AcquireLockResponse, error) {
-	t.lockMux.Lock()
-	defer t.lockMux.Unlock()
+	clientId := requestClientId(req.Base)
 
-	t.fileMux.RLock()
+	// 需要修改 FileMeta.LockInfo，必须持写锁（原实现持读锁写入，属于数据竞争）
+	t.fileMux.Lock()
+	defer t.fileMux.Unlock()
+
 	fileMeta, ok := t.files[uint64(req.FileId)]
-	t.fileMux.RUnlock()
 	if !ok {
 		logs.Error("AcquireLock failed: file not found: %d", req.FileId)
 		return nil, fmt.Errorf("file not found: %d", req.FileId)
 	}
 
 	if fileMeta.LockInfo != nil {
-
-		if time.Now().UnixNano()-fileMeta.LockInfo.AcquireTime < fileMeta.LockInfo.LeaseTimeout {
-
-			if fileMeta.LockInfo.ClientId != uint64(req.Base.RequestId) {
-				return &tracker.AcquireLockResponse{
-					Base: &base.BaseResponse{
-						Code:    1005, // ERR_LOCK_CONFLICT
-						Message: "file is locked by other client",
-					},
-					Success:     false,
-					CurrentLock: convertLockInfoToThrift(fileMeta.LockInfo),
-				}, nil
-			}
+		// AcquireTime 是纳秒时间戳，LeaseTimeout 也必须是纳秒，
+		// 原实现写死 30000 并直接比较纳秒差，等于没有租约。
+		lease := time.Duration(fileMeta.LockInfo.LeaseTimeout)
+		expired := time.Since(time.Unix(0, fileMeta.LockInfo.AcquireTime)) >= lease
+		if !expired && fileMeta.LockInfo.ClientId != clientId {
+			return &tracker.AcquireLockResponse{
+				Base: &base.BaseResponse{
+					Code:    base.ERR_LOCK_CONFLICT,
+					Message: "file is locked by other client",
+				},
+				Success:     false,
+				CurrentLock: convertLockInfoToThrift(fileMeta.LockInfo),
+			}, nil
 		}
 	}
 
 	lockInfo := &base.LockInfo{
-		ClientId:     req.Base.RequestId,
+		ClientId:     int64(clientId),
 		LockType:     req.LockType,
 		AcquireTime:  time.Now().UnixNano(),
-		LeaseTimeout: 30000, // 30秒
+		LeaseTimeout: int64(writeLeaseTTL), // 纳秒
 		LockedChunks: req.Chunks,
 	}
 
@@ -719,6 +903,7 @@ func convertLockInfoToThrift(info *meta.LockInfo) *base.LockInfo {
 		LockType:     base.LockType(info.LockType),
 		AcquireTime:  info.AcquireTime,
 		LeaseTimeout: info.LeaseTimeout,
+		LockedChunks: info.LockedChunks,
 	}
 }
 
@@ -731,7 +916,17 @@ func convertLockInfoFromThrift(info *base.LockInfo) *meta.LockInfo {
 		LockType:     meta.LockType(info.LockType),
 		AcquireTime:  info.AcquireTime,
 		LeaseTimeout: info.LeaseTimeout,
+		LockedChunks: info.LockedChunks,
 	}
+}
+
+// requestClientId 统一从 BaseRequest 中取客户端 ID。
+// 目前客户端把 clientId 放在 RequestId 里传递，这里集中处理以兼容 Base 为空的情况。
+func requestClientId(baseReq *base.BaseRequest) uint64 {
+	if baseReq == nil {
+		return 0
+	}
+	return uint64(baseReq.RequestId)
 }
 
 func convertReplicaInfoToThrift(info *meta.ReplicaInfo) *base.ReplicaInfo {
@@ -1080,7 +1275,7 @@ func (t *TrackerNode) InstallSnapshot(ctx context.Context, req *tracker.InstallS
 			Message:   "success",
 			Timestamp: time.Now().UnixNano(),
 		},
-		Term:        t.raftState.currentTerm,
+		Term:        t.currentTerm(),
 		BytesStored: req.Meta.Size,
 	}, nil
 }
@@ -1094,11 +1289,12 @@ func (t *TrackerNode) ProposeConfigChange(ctx context.Context, req *tracker.Prop
 			Timestamp: time.Now().UnixNano(),
 		},
 		Accepted: true,
-		LogIndex: int64(len(t.raftState.logs)),
+		LogIndex: int64(t.raftLogCount()),
 	}, nil
 }
 
 func (t *TrackerNode) Close() error {
+	t.stopRaft()
 	if t.heartbeatLog != nil {
 		if err := t.heartbeatLog.Close(); err != nil {
 			logs.Error("Failed to close heartbeat recorder: %v", err)

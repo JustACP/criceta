@@ -35,10 +35,10 @@ func TestNewSliceBasedChunk(t *testing.T) {
 
 	// 正常情况
 	chunk, err := NewSliceBasedChunk(idgen.NextID(), 1, 1)
-	defer chunk.Close()
 	if err != nil {
 		t.Fatalf("Failed to create chunk: %v", err)
 	}
+	defer chunk.Close()
 	if chunk.Head.Id == 0 {
 		t.Errorf("Chunk ID should not be zero")
 	}
@@ -60,17 +60,81 @@ func TestNewSliceBasedChunk(t *testing.T) {
 	}
 
 	// 异常情况：FileId未设置
-	_, err = NewSliceBasedChunk(idgen.NextID(), 0, 1)
-	if err == nil {
+	if _, err := NewSliceBasedChunk(idgen.NextID(), 0, 1); err == nil {
 		t.Errorf("Expected error when FileId is not set")
 	}
 
-	// 异常情况：Idx未设置
-	_, err = NewSliceBasedChunk(idgen.NextID(), 1, 0)
-	if err == nil {
-		t.Errorf("Expected error when Idx is not set")
+	// offset 为 0 是合法值（文件首个 Chunk 的 offset 就是 0）
+	offsetZeroChunk, err := NewSliceBasedChunk(idgen.NextID(), 1, 0)
+	if err != nil {
+		t.Errorf("offset 0 should be valid, got error: %v", err)
+	} else {
+		defer offsetZeroChunk.Close()
 	}
 
+	// 同一个 chunk id 重复创建必须失败：否则 O_TRUNC 会静默丢掉已有 Chunk 数据
+	chunkId := idgen.NextID()
+	first, err := NewSliceBasedChunk(chunkId, 1, 0)
+	if err != nil {
+		t.Fatalf("Failed to create chunk: %v", err)
+	}
+	defer first.Close()
+
+	if _, err := NewSliceBasedChunk(chunkId, 1, 0); err == nil {
+		t.Errorf("Expected error when creating a chunk with an existing id")
+	}
+}
+
+// TestOpenChunkPreservesData 验证节点重启后能从 meta 文件恢复 Chunk 及其 Slice 数据。
+// 这是 Storage 节点重启不丢数据的核心不变量。
+func TestOpenChunkPreservesData(t *testing.T) {
+	initTestPath()
+	defer cleanTestDir()
+
+	chunkId := idgen.NextID()
+	fileId := uint64(7)
+	created, err := NewSliceBasedChunk(chunkId, fileId, 0)
+	if err != nil {
+		t.Fatalf("Failed to create chunk: %v", err)
+	}
+
+	data := []byte("criceta-persist-check")
+	if _, err := created.WriteAt(data, 0); err != nil {
+		t.Fatalf("Failed to write chunk: %v", err)
+	}
+	crcBefore := created.Head.CRC
+	metaPath := ChunkMetaFilePath(fileId, chunkId)
+
+	if err := created.Close(); err != nil {
+		t.Fatalf("Failed to close chunk: %v", err)
+	}
+
+	// 模拟重启：仅通过 meta 文件路径恢复
+	reopened, err := OpenChunkByPath(metaPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen chunk: %v", err)
+	}
+	defer reopened.Close()
+
+	if reopened.Head.Id != chunkId || reopened.Head.FileId != fileId {
+		t.Errorf("reopened chunk identity mismatch: id=%d file=%d", reopened.Head.Id, reopened.Head.FileId)
+	}
+
+	got := make([]byte, len(data))
+	if _, err := reopened.ReadAt(got, 0); err != nil && !strings.EqualFold(err.Error(), io.EOF.Error()) {
+		t.Fatalf("Failed to read reopened chunk: %v", err)
+	}
+	if string(got) != string(data) {
+		t.Errorf("data mismatch after reopen: got %q, want %q", got, data)
+	}
+	if reopened.Head.CRC != crcBefore {
+		t.Errorf("CRC mismatch after reopen: got %d, want %d", reopened.Head.CRC, crcBefore)
+	}
+
+	// 重新打开后继续写必须沿用正确的最高版本号
+	if _, err := reopened.WriteAt([]byte("-more"), int64(len(data))); err != nil {
+		t.Fatalf("Failed to append after reopen: %v", err)
+	}
 }
 
 func TestOpenSliceBasedChunk(t *testing.T) {

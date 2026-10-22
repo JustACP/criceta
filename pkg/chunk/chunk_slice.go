@@ -93,10 +93,11 @@ func NewSliceBasedChunk(id, fileId, offset uint64, chOptions ...CHOption) (*Slic
 
 	sliceManager := NewSliceManager(ch.Id, MaxChunkSize)
 
-	chunkFilePath := filepath.Join(ChunkMetaPath, fmt.Sprintf("chunk_%d_%d.meta", ch.FileId, ch.Id))
+	chunkFilePath := ChunkMetaFilePath(ch.FileId, ch.Id)
 	chunkFile, err := os.OpenFile(
 		chunkFilePath,
-		os.O_RDWR|os.O_CREATE|os.O_TRUNC,
+		// O_EXCL: 已存在的 chunk 元数据绝不能被截断，否则会静默丢掉整个 Chunk 的数据
+		os.O_RDWR|os.O_CREATE|os.O_EXCL,
 		0644,
 	)
 	if err != nil {
@@ -118,55 +119,101 @@ func NewSliceBasedChunk(id, fileId, offset uint64, chOptions ...CHOption) (*Slic
 	}, nil
 }
 
-// OpenChunkByPath 通过路径打开所有已存在的基于Slice的Chunk
-func OpenChunkByPath(path string) (*SliceBasedChunk, error) {
-	metaFiles, err := filepath.Glob(path)
-	if len(metaFiles) <= 0 || err != nil || len(metaFiles) > 1 {
-		return nil, fmt.Errorf("open chunk meta info error")
+// ChunkMetaFileName 返回 Chunk 元数据文件名
+func ChunkMetaFileName(fileId, chunkId uint64) string {
+	return fmt.Sprintf("chunk_%d_%d.meta", fileId, chunkId)
+}
+
+// ChunkMetaFilePath 返回 Chunk 元数据文件的完整路径
+func ChunkMetaFilePath(fileId, chunkId uint64) string {
+	return filepath.Join(ChunkMetaPath, ChunkMetaFileName(fileId, chunkId))
+}
+
+// parseChunkIdFromMetaPath 从 chunk meta 文件名中解析 chunk id
+func parseChunkIdFromMetaPath(path string) (uint64, error) {
+	name := strings.TrimSuffix(filepath.Base(path), ".meta")
+	parts := strings.Split(name, "_")
+	if len(parts) != 3 || parts[0] != "chunk" {
+		return 0, fmt.Errorf("invalid chunk meta file name: %s", filepath.Base(path))
 	}
 
-	pathSplit := strings.Split(path, "_")
-	if len(pathSplit) != 2 {
-		return nil, fmt.Errorf("chunk path is not valid")
+	chunkId, err := strconv.ParseUint(parts[2], 10, 64)
+	if err != nil || chunkId == 0 {
+		return 0, fmt.Errorf("invalid chunk id in meta file name: %s", filepath.Base(path))
 	}
-	chunkId, _ := strconv.ParseUint(pathSplit[1], 10, 64)
-	chunkFilePath := metaFiles[0]
+
+	return chunkId, nil
+}
+
+// OpenChunkByPath 通过元数据文件路径打开一个已存在的基于Slice的Chunk。
+// 打开后会恢复该 Chunk 下的全部有效 Slice，并保持元数据文件句柄可写，
+// 以便后续 WriteAt/Compact 更新 ChunkHead。
+func OpenChunkByPath(path string) (*SliceBasedChunk, error) {
+	chunkId, err := parseChunkIdFromMetaPath(path)
+	if err != nil {
+		return nil, err
+	}
+
 	chunkFile, err := os.OpenFile(
-		chunkFilePath,
+		path,
 		os.O_RDWR,
 		0644,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open chunk meta file: %w", err)
 	}
-	defer chunkFile.Close()
 
 	// 读取ChunkHead
 	headBytes := make([]byte, ChunkHeadSize)
-	if _, err := chunkFile.Read(headBytes); err != nil {
+	if _, err := io.ReadFull(chunkFile, headBytes); err != nil {
+		chunkFile.Close()
 		return nil, fmt.Errorf("failed to read chunk head: %w", err)
 	}
 
 	ch := &ChunkHead{}
 	if err := ch.FromBinary(headBytes); err != nil {
+		chunkFile.Close()
 		return nil, fmt.Errorf("failed to parse chunk head: %w", err)
+	}
+
+	// 兼容历史数据：文件名中的 chunk id 是权威来源
+	if ch.Id == 0 {
+		ch.Id = chunkId
+	}
+	if ch.Id != chunkId {
+		chunkFile.Close()
+		return nil, fmt.Errorf("chunk id mismatch: file name=%d, head=%d", chunkId, ch.Id)
 	}
 
 	// 创建SliceManager
 	sliceManager := NewSliceManager(ch.Id, MaxChunkSize)
 
 	// 读取所有Slice
-	files, _ := filepath.Glob(filepath.Join(SlicePath, fmt.Sprintf("slice_%d_*.dat", chunkId)))
+	files, err := filepath.Glob(filepath.Join(SlicePath, fmt.Sprintf("slice_%d_*.dat", ch.Id)))
+	if err != nil {
+		chunkFile.Close()
+		return nil, fmt.Errorf("failed to list slice files: %w", err)
+	}
+
 	for _, currSlicePath := range files {
 		currSlice, err := OpenSlice(currSlicePath)
-		if err != nil && currSlice != nil {
-			sliceManager.AppendSlice(currSlice)
+		if err != nil {
+			// 单个 Slice 损坏不应阻断整个 Chunk 的加载
+			continue
+		}
+
+		if err := sliceManager.AppendSlice(currSlice); err != nil {
+			// 已删除/合并掉的 Slice 无法重新挂载，直接关闭句柄
+			currSlice.Close()
+			continue
 		}
 	}
+	sliceManager.Refresh()
 
 	return &SliceBasedChunk{
 		Head:         ch,
 		SliceManager: sliceManager,
+		meta:         chunkFile,
 	}, nil
 }
 
@@ -177,10 +224,26 @@ func OpenChunk(chunkId uint64) (*SliceBasedChunk, error) {
 
 // OpenSliceBasedChunk 打开一个已存在的基于Slice的Chunk
 func OpenSliceBasedChunk(chunkId uint64) (*SliceBasedChunk, error) {
-	return OpenChunkByPath(filepath.Join(ChunkMetaPath, fmt.Sprintf("chunk_*_%d.meta", chunkId)))
+	pattern := filepath.Join(ChunkMetaPath, fmt.Sprintf("chunk_*_%d.meta", chunkId))
+	metaFiles, err := filepath.Glob(pattern)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list chunk meta files: %w", err)
+	}
+
+	switch len(metaFiles) {
+	case 0:
+		return nil, fmt.Errorf("chunk meta not found: %d", chunkId)
+	case 1:
+		return OpenChunkByPath(metaFiles[0])
+	default:
+		return nil, fmt.Errorf("multiple chunk meta files found for chunk %d", chunkId)
+	}
 }
 
 func (sc *SliceBasedChunk) flushHead() error {
+	if sc.meta == nil {
+		return fmt.Errorf("chunk %v has no open meta file", sc.Head.Id)
+	}
 
 	if headBytes, err := sc.Head.ToBinary(); err == nil {
 		_, err := sc.meta.WriteAt(headBytes, 0)
@@ -348,22 +411,55 @@ func (sc *SliceBasedChunk) Compact() error {
 
 // UpdateCRC 更新CRC
 func (sc *SliceBasedChunk) fullUpdateCRC() error {
+	crc, err := sc.computeCRC()
+	if err != nil {
+		return err
+	}
 
-	// 重置CRC
-	sc.Head.CRC = 0
+	sc.Head.CRC = crc
 
+	// 保存ChunkHead
+	return sc.flushHead()
+}
+
+// computeCRC 遍历 Chunk 的全部数据计算 CRC32（调用方需自行加锁）
+func (sc *SliceBasedChunk) computeCRC() (uint32, error) {
+	crc := uint32(0)
 	step := make([]byte, UpdateSteps)
 	var readErr error
+
 	for off := int64(0); readErr == nil || !strings.EqualFold(readErr.Error(), io.EOF.Error()); off += int64(UpdateSteps) {
 		var n int
 		n, readErr = sc.SliceManager.ReadAt(step, off)
 		if readErr != nil && !strings.EqualFold(readErr.Error(), io.EOF.Error()) {
-			return fmt.Errorf("chunk :%v read slice manger error, err: %v", sc.Head.Id, readErr.Error())
+			return 0, fmt.Errorf("chunk :%v read slice manger error, err: %v", sc.Head.Id, readErr.Error())
 		}
-		sc.Head.CRC = utils.UpdateCRC32(sc.Head.CRC, step[:n])
+		crc = utils.UpdateCRC32(crc, step[:n])
 	}
 
-	// 保存ChunkHead
+	return crc, nil
+}
+
+// ComputeCRC 计算当前数据内容的 CRC32，不修改 ChunkHead
+func (sc *SliceBasedChunk) ComputeCRC() (uint32, error) {
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+
+	return sc.computeCRC()
+}
+
+// ApplyMeta 用权威元数据（版本号、修改时间）覆盖本地 ChunkHead 并落盘
+func (sc *SliceBasedChunk) ApplyMeta(version uint64, modifyAt int64) error {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	if version > 0 {
+		sc.Head.Version = version
+	}
+	if modifyAt > 0 {
+		sc.Head.ModifyAt = modifyAt
+	}
+
 	return sc.flushHead()
 }
 
@@ -387,34 +483,14 @@ func (sc *SliceBasedChunk) Validate() error {
 	return nil
 }
 
-// CalculateCRC 计算 chunk 的 CRC 值
+// CalculateCRC 计算 chunk 的 CRC 值（十六进制字符串，仅用于展示/校验）
 func (sc *SliceBasedChunk) CalculateCRC() (string, error) {
-	sc.mu.RLock()
-	defer sc.mu.RUnlock()
-
-	// 重置 CRC
-	oldCRC := sc.Head.CRC
-	sc.Head.CRC = 0
-
-	step := make([]byte, UpdateSteps)
-	var readErr error
-	for off := int64(0); readErr == nil || !strings.EqualFold(readErr.Error(), io.EOF.Error()); off += int64(UpdateSteps) {
-		var n int
-		n, readErr = sc.SliceManager.ReadAt(step, off)
-		if readErr != nil && !strings.EqualFold(readErr.Error(), io.EOF.Error()) {
-			sc.Head.CRC = oldCRC
-			return "", fmt.Errorf("chunk :%v read slice manger error, err: %v", sc.Head.Id, readErr.Error())
-		}
-		sc.Head.CRC = utils.UpdateCRC32(sc.Head.CRC, step[:n])
+	crc, err := sc.ComputeCRC()
+	if err != nil {
+		return "", err
 	}
 
-	// 将 CRC 转换为字符串
-	crcStr := fmt.Sprintf("%08x", sc.Head.CRC)
-
-	// 恢复原始 CRC
-	sc.Head.CRC = oldCRC
-
-	return crcStr, nil
+	return fmt.Sprintf("%08x", crc), nil
 }
 
 // GetSliceCount 获取当前 Chunk 的 Slice 数量

@@ -44,10 +44,17 @@ struct ReadChunkResponse {
     3: binary data
 }
 
+// 存储节点地址信息（副本拉取时用于回源）
+struct NodeInfo {
+    1: i64 node_id
+    2: string address
+}
+
 struct SyncChunkRequest {
     1: base.BaseRequest base
     2: ChunkMeta meta
     3: binary data
+    4: optional NodeInfo source_node  // 拉模式：由目标节点向该源节点回源拉取数据
 }
 
 struct SyncChunkResponse {

@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -147,13 +148,36 @@ func (c *Client) Flush(ctx context.Context, fileId int64) error {
 
 	err := c.flushBuffer(ctx, wb)
 	if err != nil {
-		logs.Error("fileId: %v flush error, err: %v", err)
+		logs.Error("fileId: %v flush error, err: %v", wb.fileId, err)
 		return err
 	}
 
 	delete(c.writeBuffers, fileId)
 
 	return nil
+}
+
+// ReleaseFile 结束一次写会话：先刷盘，再释放 Tracker 上的写租约。
+// 不释放租约会导致该文件在租约过期前（当前 30s）无法被其他客户端写入。
+func (c *Client) ReleaseFile(ctx context.Context, fileId int64) error {
+	var errs error
+
+	if err := c.Flush(ctx, fileId); err != nil {
+		errs = errors.Join(errs, fmt.Errorf("flush file %d failed: %w", fileId, err))
+	}
+
+	_, err := c.trackerCli.UnlockFile(ctx, &tracker.UnlockFileRequest{
+		Base: &base.BaseRequest{
+			RequestId: int64(c.clientId),
+			Timestamp: time.Now().UnixNano(),
+		},
+		FileId: fileId,
+	})
+	if err != nil {
+		errs = errors.Join(errs, fmt.Errorf("unlock file %d failed: %w", fileId, err))
+	}
+
+	return errs
 }
 
 // flushBuffer 将缓冲区数据写入存储节点

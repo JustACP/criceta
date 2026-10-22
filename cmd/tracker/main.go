@@ -43,11 +43,17 @@ func main() {
 
 	// 创建tracker node
 	node := tracker.NewTrackerNode()
+	if node == nil {
+		logs.Fatal("Failed to create tracker node")
+	}
+	node.SetNodeID(rawConfig.ServerId)
 	if err := node.Init(); err != nil {
 		logs.Fatal("Failed to init tracker node: %v", err)
 	}
+	defer node.Close()
 
-	// 启动节点健康检查
+	// 启动节点健康检查（Init 内部已调用，这里保留显式调用以兼容旧行为；
+	// StartNodeHealthCheck 内部用 sync.Once 保证只启动一次）
 	node.StartNodeHealthCheck()
 
 	// 创建RPC服务

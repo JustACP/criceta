@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/JustACP/criceta/kitex_gen/criceta/tracker"
 	"github.com/JustACP/criceta/kitex_gen/criceta/tracker/trackerservice"
 	"github.com/JustACP/criceta/pkg/common/logs"
+	"github.com/JustACP/criceta/pkg/config"
 	"github.com/cloudwego/kitex/client"
 )
 
@@ -18,8 +20,15 @@ const (
 	electionTimeout    = 150 * time.Millisecond
 	heartbeatInterval  = 50 * time.Millisecond
 	maxElectionTimeout = 300 * time.Millisecond
+	// voteRequestTimeout 一轮选举最多等待多久，避免 goroutine 永久阻塞
+	voteRequestTimeout = 2 * time.Second
 )
 
+// RaftState Raft 节点状态。
+//
+// 注意：这里只实现了「选举 + 心跳 + 日志追加」的最小闭环，
+// 日志复制（Leader 主动 send/commit）仍未实现，Tracker 的元数据也还没有
+// 走状态机。真正接入 Raft 之前，standalone 模式下不会启动选举。
 type RaftState struct {
 	currentTerm int64
 	votedFor    int64
@@ -30,10 +39,26 @@ type RaftState struct {
 	matchIndex  map[int64]int64
 	role        base.NodeRole
 	leaderId    int64
-	mu          sync.RWMutex
+	lastContact time.Time
+
+	// peers 是 Tracker 集群成员（来自配置的 cluster_nodes / slave_of / slaves），
+	// 不是 Storage 节点列表。
+	peers []*tracker.NodeInfo
+
+	// enabled=false 时完全不参与选举（standalone 模式）
+	enabled bool
+
+	stopCh   chan struct{}
+	stopOnce sync.Once
+
+	mu sync.RWMutex
 }
 
+// initRaft 根据集群模式初始化 Raft 状态。
+// standalone（默认）下只保留状态对象，不启动选举协程，避免无意义的空转。
 func (t *TrackerNode) initRaft() {
+	enabled, peers := raftClusterFromConfig()
+
 	t.raftState = &RaftState{
 		currentTerm: 0,
 		votedFor:    -1,
@@ -43,112 +68,294 @@ func (t *TrackerNode) initRaft() {
 		nextIndex:   make(map[int64]int64),
 		matchIndex:  make(map[int64]int64),
 		role:        base.NodeRole_FOLLOWER,
+		peers:       peers,
+		enabled:     enabled,
+		stopCh:      make(chan struct{}),
+		lastContact: time.Now(),
 	}
-	go t.runElectionTimer()
+
+	if enabled {
+		logs.Info("Raft enabled with %d peer(s)", len(peers))
+		go t.runElectionTimer()
+	}
+}
+
+// raftClusterFromConfig 从配置中解析集群模式与 Tracker 成员。
+// 配置不可用（例如单测环境）时按 standalone 处理。
+func raftClusterFromConfig() (bool, []*tracker.NodeInfo) {
+	rawConfig, err := config.GetRawConfig[config.TrackerNodeConfig]()
+	if err != nil {
+		return false, nil
+	}
+
+	switch rawConfig.ClusterMode {
+	case "cluster":
+		return true, trackerPeerInfos(rawConfig.ClusterNodes)
+	case "master-slave":
+		slaves := make([]config.ServerConfig, 0, len(rawConfig.Slaves)+1)
+		if rawConfig.SlaveOf != nil {
+			slaves = append(slaves, *rawConfig.SlaveOf)
+		}
+		slaves = append(slaves, rawConfig.Slaves...)
+		return true, trackerPeerInfos(slaves)
+	default: // standalone
+		return false, nil
+	}
+}
+
+func trackerPeerInfos(servers []config.ServerConfig) []*tracker.NodeInfo {
+	peers := make([]*tracker.NodeInfo, 0, len(servers))
+	for _, srv := range servers {
+		if srv.ServerIP == nil {
+			continue
+		}
+		peers = append(peers, &tracker.NodeInfo{
+			NodeId:  srv.ServerId,
+			Address: fmt.Sprintf("%s:%d", *srv.ServerIP, srv.Port),
+			Status:  base.NodeStatus_ONLINE,
+		})
+	}
+	return peers
 }
 
 func (t *TrackerNode) runElectionTimer() {
 	for {
-		timeout := time.Duration(electionTimeout + time.Duration(t.nodeId%10)*10*time.Millisecond)
-		timer := time.NewTimer(timeout)
-		<-timer.C
+		timer := time.NewTimer(randomElectionTimeout())
+		select {
+		case <-t.raftState.stopCh:
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
 
-		t.raftState.mu.Lock()
-		if t.raftState.role == base.NodeRole_FOLLOWER {
+		if t.shouldStartElection() {
 			t.startElection()
 		}
-		t.raftState.mu.Unlock()
 	}
 }
 
+func randomElectionTimeout() time.Duration {
+	jitter := time.Duration(rand.Int63n(int64(maxElectionTimeout - electionTimeout)))
+	return electionTimeout + jitter
+}
+
+func (t *TrackerNode) shouldStartElection() bool {
+	t.raftState.mu.RLock()
+	defer t.raftState.mu.RUnlock()
+
+	if t.raftState.role == base.NodeRole_LEADER {
+		return false
+	}
+	return time.Since(t.raftState.lastContact) >= electionTimeout
+}
+
+// startElection 拉票并尝试成为 Leader。
+//
+// 选举在独立的 goroutine 中运行，有两个约束：
+//  1. 调用方不得持有 raftState.mu（sync.Mutex 不可重入）；
+//  2. 单节点集群直接当选，避免空集群永远选不出 Leader。
 func (t *TrackerNode) startElection() {
 	t.raftState.mu.Lock()
-	defer t.raftState.mu.Unlock()
+	if t.raftState.role == base.NodeRole_LEADER {
+		t.raftState.mu.Unlock()
+		return
+	}
 
 	t.raftState.role = base.NodeRole_CANDIDATE
 	t.raftState.currentTerm++
-	t.raftState.votedFor = int64(t.nodeId)
+	term := t.raftState.currentTerm
+	t.raftState.votedFor = t.nodeId
+	t.raftState.lastContact = time.Now()
 
-	voteChan := make(chan bool, len(t.nodes))
+	lastLogIndex := int64(len(t.raftState.logs) - 1)
+	lastLogTerm := int64(0)
+	if lastLogIndex >= 0 {
+		lastLogTerm = t.raftState.logs[lastLogIndex].Term
+	}
+	peers := append([]*tracker.NodeInfo(nil), t.raftState.peers...)
+	t.raftState.mu.Unlock()
+
+	// 单节点集群直接当选
+	if len(peers) == 0 {
+		t.becomeLeader(term)
+		return
+	}
+
+	voteCh := make(chan bool, len(peers))
+	for _, peer := range peers {
+		go t.requestVote(peer, term, lastLogIndex, lastLogTerm, voteCh)
+	}
+
 	votes := 1
-	majority := len(t.nodes)/2 + 1
+	majority := len(peers)/2 + 1
+	deadline := time.NewTimer(voteRequestTimeout)
+	defer deadline.Stop()
 
-	// 发送RequestVote RPC
-	for nodeId, node := range t.nodes {
-		if int64(nodeId) == int64(t.nodeId) {
-			continue
+	for votes < majority {
+		select {
+		case granted := <-voteCh:
+			if granted {
+				votes++
+			}
+		case <-deadline.C:
+			logs.Warn("Election for term %d timed out with %d/%d votes", term, votes, majority)
+			t.stepDownIfCandidate(term)
+			return
+		case <-t.raftState.stopCh:
+			return
+		}
+	}
+
+	t.becomeLeader(term)
+}
+
+// requestVote 向单个 peer 拉票，结果写入 voteCh
+func (t *TrackerNode) requestVote(peer *tracker.NodeInfo, term, lastLogIndex, lastLogTerm int64, voteCh chan<- bool) {
+	cli, err := trackerservice.NewClient(
+		fmt.Sprintf("tracker-%d", peer.NodeId),
+		client.WithHostPorts(peer.Address),
+		client.WithRPCTimeout(voteRequestTimeout),
+	)
+	if err != nil {
+		logs.Error("Failed to create tracker client for node %d: %v", peer.NodeId, err)
+		voteCh <- false
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), voteRequestTimeout)
+	defer cancel()
+
+	resp, err := cli.RequestVote(ctx, &tracker.RequestVoteRequest{
+		Base: &base.BaseRequest{
+			RequestId: time.Now().UnixNano(),
+			Timestamp: time.Now().UnixNano(),
+		},
+		Term:         term,
+		CandidateId:  t.nodeId,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
+	})
+	if err != nil {
+		voteCh <- false
+		return
+	}
+
+	// 对方任期更高，立刻退回 follower
+	if resp.Term > term {
+		t.stepDownIfCandidate(term)
+	}
+
+	voteCh <- resp.VoteGranted
+}
+
+func (t *TrackerNode) becomeLeader(term int64) {
+	t.raftState.mu.Lock()
+	if t.raftState.currentTerm != term || t.raftState.role != base.NodeRole_CANDIDATE {
+		t.raftState.mu.Unlock()
+		return
+	}
+
+	t.raftState.role = base.NodeRole_LEADER
+	t.raftState.leaderId = t.nodeId
+	t.raftState.lastContact = time.Now()
+	for _, peer := range t.raftState.peers {
+		t.raftState.nextIndex[peer.NodeId] = int64(len(t.raftState.logs))
+		t.raftState.matchIndex[peer.NodeId] = -1
+	}
+	t.raftState.mu.Unlock()
+
+	logs.Info("Tracker node %d became leader for term %d", t.nodeId, term)
+	go t.runLeaderHeartbeat(term)
+}
+
+// stepDownIfCandidate 若仍是该任期的候选者则退回 follower
+func (t *TrackerNode) stepDownIfCandidate(term int64) {
+	t.raftState.mu.Lock()
+	defer t.raftState.mu.Unlock()
+
+	if t.raftState.role == base.NodeRole_CANDIDATE && t.raftState.currentTerm == term {
+		t.raftState.role = base.NodeRole_FOLLOWER
+	}
+}
+
+func (t *TrackerNode) isLeader(term int64) bool {
+	t.raftState.mu.RLock()
+	defer t.raftState.mu.RUnlock()
+	return t.raftState.role == base.NodeRole_LEADER && t.raftState.currentTerm == term
+}
+
+// runLeaderHeartbeat 定期向所有 peer 发送空 AppendEntries，维持领导权并刷新 follower 的选举计时
+func (t *TrackerNode) runLeaderHeartbeat(term int64) {
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-t.raftState.stopCh:
+			return
+		case <-ticker.C:
 		}
 
-		go func(nodeId int64, node *tracker.NodeInfo) {
-			lastLogIndex := int64(-1)
-			lastLogTerm := int64(0)
-			if len(t.raftState.logs) > 0 {
-				lastLogIndex = int64(len(t.raftState.logs) - 1)
-				lastLogTerm = t.raftState.logs[lastLogIndex].Term
+		if !t.isLeader(term) {
+			return
+		}
+		t.broadcastAppendEntries(term)
+	}
+}
+
+func (t *TrackerNode) broadcastAppendEntries(term int64) {
+	t.raftState.mu.RLock()
+	peers := append([]*tracker.NodeInfo(nil), t.raftState.peers...)
+	prevLogIndex := int64(len(t.raftState.logs) - 1)
+	prevLogTerm := int64(0)
+	if prevLogIndex >= 0 {
+		prevLogTerm = t.raftState.logs[prevLogIndex].Term
+	}
+	leaderCommit := t.raftState.commitIndex
+	t.raftState.mu.RUnlock()
+
+	for _, peer := range peers {
+		go func(peer *tracker.NodeInfo) {
+			cli, err := trackerservice.NewClient(
+				fmt.Sprintf("tracker-%d", peer.NodeId),
+				client.WithHostPorts(peer.Address),
+				client.WithRPCTimeout(voteRequestTimeout),
+			)
+			if err != nil {
+				return
 			}
 
-			req := &tracker.RequestVoteRequest{
+			ctx, cancel := context.WithTimeout(context.Background(), voteRequestTimeout)
+			defer cancel()
+
+			resp, err := cli.AppendEntries(ctx, &tracker.AppendEntriesRequest{
 				Base: &base.BaseRequest{
 					RequestId: time.Now().UnixNano(),
 					Timestamp: time.Now().UnixNano(),
 				},
-				Term:         t.raftState.currentTerm,
-				CandidateId:  int64(t.nodeId),
-				LastLogIndex: lastLogIndex,
-				LastLogTerm:  lastLogTerm,
-			}
-
-			// 创建节点客户端
-			client, err := trackerservice.NewClient(
-				fmt.Sprintf("tracker-%d", nodeId),
-				client.WithHostPorts(node.Address),
-				client.WithRPCTimeout(time.Second*5),
-			)
+				Term:         term,
+				LeaderId:     t.nodeId,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      nil,
+				LeaderCommit: leaderCommit,
+			})
 			if err != nil {
-				logs.Error("Failed to create client for node %d: %v", nodeId, err)
-				voteChan <- false
 				return
 			}
 
-			// 发送投票请求
-			resp, err := client.RequestVote(context.Background(), req)
-			if err != nil {
-				logs.Error("Failed to send RequestVote to node %d: %v", nodeId, err)
-				voteChan <- false
-				return
-			}
-
-			voteChan <- resp.VoteGranted
-		}(int64(nodeId), node)
-	}
-
-	// 等待投票结果
-	go func() {
-		for i := 0; i < len(t.nodes)-1; i++ {
-			if <-voteChan {
-				votes++
-				if votes >= majority {
-					t.raftState.mu.Lock()
-					if t.raftState.role == base.NodeRole_CANDIDATE {
-						t.raftState.role = base.NodeRole_LEADER
-						// 初始化leader状态
-						for nodeId := range t.nodes {
-							t.raftState.nextIndex[int64(nodeId)] = int64(len(t.raftState.logs))
-							t.raftState.matchIndex[int64(nodeId)] = -1
-						}
-					}
-					t.raftState.mu.Unlock()
-					return
+			if resp.Term > term {
+				t.raftState.mu.Lock()
+				if resp.Term > t.raftState.currentTerm {
+					t.raftState.role = base.NodeRole_FOLLOWER
+					t.raftState.currentTerm = resp.Term
+					t.raftState.votedFor = -1
+					t.raftState.lastContact = time.Now()
 				}
+				t.raftState.mu.Unlock()
 			}
-		}
-		// 如果没有获得足够的票数，保持follower状态
-		t.raftState.mu.Lock()
-		if t.raftState.role == base.NodeRole_CANDIDATE {
-			t.raftState.role = base.NodeRole_FOLLOWER
-		}
-		t.raftState.mu.Unlock()
-	}()
+		}(peer)
+	}
 }
 
 func (t *TrackerNode) RequestVote(ctx context.Context, req *tracker.RequestVoteRequest) (*tracker.RequestVoteResponse, error) {
@@ -164,6 +371,10 @@ func (t *TrackerNode) RequestVote(ctx context.Context, req *tracker.RequestVoteR
 		VoteGranted: false,
 	}
 
+	if !t.raftState.enabled {
+		return resp, nil
+	}
+
 	if req.Term < t.raftState.currentTerm {
 		return resp, nil
 	}
@@ -174,10 +385,9 @@ func (t *TrackerNode) RequestVote(ctx context.Context, req *tracker.RequestVoteR
 		t.raftState.votedFor = -1
 	}
 
-	lastLogIndex := int64(-1)
+	lastLogIndex := int64(len(t.raftState.logs) - 1)
 	lastLogTerm := int64(0)
-	if len(t.raftState.logs) > 0 {
-		lastLogIndex = int64(len(t.raftState.logs) - 1)
+	if lastLogIndex >= 0 {
 		lastLogTerm = t.raftState.logs[lastLogIndex].Term
 	}
 
@@ -185,6 +395,7 @@ func (t *TrackerNode) RequestVote(ctx context.Context, req *tracker.RequestVoteR
 		(req.LastLogTerm > lastLogTerm ||
 			(req.LastLogTerm == lastLogTerm && req.LastLogIndex >= lastLogIndex)) {
 		t.raftState.votedFor = req.CandidateId
+		t.raftState.lastContact = time.Now()
 		resp.VoteGranted = true
 	}
 
@@ -211,6 +422,11 @@ func (t *TrackerNode) AppendEntries(ctx context.Context, req *tracker.AppendEntr
 	// 重置选举计时器
 	t.raftState.role = base.NodeRole_FOLLOWER
 	t.raftState.leaderId = req.LeaderId
+	t.raftState.lastContact = time.Now()
+	if req.Term > t.raftState.currentTerm {
+		t.raftState.currentTerm = req.Term
+		t.raftState.votedFor = -1
+	}
 
 	// 日志一致性检查
 	if req.PrevLogIndex >= 0 {
@@ -274,7 +490,7 @@ func (t *TrackerNode) applyLogs() {
 
 // applyNormalLog 应用普通操作日志
 func (t *TrackerNode) applyNormalLog(entry *base.RaftLogEntry) {
-	// TODO: 解析日志数据并执行相应的操作
+	// TODO: 解析日志数据并执行相应的操作（元数据状态机尚未接入 Raft）
 	logs.Info("Applying normal log: index=%d, term=%d", entry.Index, entry.Term)
 }
 
@@ -340,9 +556,24 @@ func (t *TrackerNode) updateNode(config *base.RaftConfigChange) {
 	}
 }
 
-func min(a, b int64) int64 {
-	if a < b {
-		return a
+// stopRaft 停止选举/心跳协程
+func (t *TrackerNode) stopRaft() {
+	if t.raftState == nil {
+		return
 	}
-	return b
+	t.raftState.stopOnce.Do(func() {
+		close(t.raftState.stopCh)
+	})
+}
+
+func (t *TrackerNode) currentTerm() int64 {
+	t.raftState.mu.RLock()
+	defer t.raftState.mu.RUnlock()
+	return t.raftState.currentTerm
+}
+
+func (t *TrackerNode) raftLogCount() int {
+	t.raftState.mu.RLock()
+	defer t.raftState.mu.RUnlock()
+	return len(t.raftState.logs)
 }

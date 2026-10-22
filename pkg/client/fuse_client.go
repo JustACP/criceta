@@ -272,6 +272,10 @@ func (f *CricetaFile) Write(ctx context.Context, fh fs.FileHandle, data []byte, 
 		f.size = newSize
 	}
 
+	// 数据此时只进了客户端写缓冲，必须标记为脏，
+	// 否则 Flush/Release 会直接返回，数据永远不会落盘。
+	f.modified = true
+
 	return uint32(len(data)), 0
 }
 
@@ -279,14 +283,8 @@ func (f *CricetaFile) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	if !f.modified {
-		return 0
-	}
-
-	// Chunk的分配和写入入口
-	err := f.fs.client.WriteFile(ctx, f.fileId, 0, f.data)
-	if err != nil {
-		logs.Error("Failed to write file: %v", err)
+	if err := f.fs.client.Flush(ctx, f.fileId); err != nil {
+		logs.Error("Failed to flush file %d: %v", f.fileId, err)
 		return syscall.EIO
 	}
 
@@ -325,10 +323,16 @@ func (f *CricetaFile) Open(ctx context.Context, flags uint32) (fh fs.FileHandle,
 }
 
 func (f *CricetaFile) Release(ctx context.Context, fh fs.FileHandle) syscall.Errno {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 
-	if f.modified {
-		return f.Flush(ctx, fh)
+	// 关闭文件句柄时一次性完成：刷缓冲 + 释放 Tracker 写租约
+	if err := f.fs.client.ReleaseFile(ctx, f.fileId); err != nil {
+		logs.Error("Failed to release file %d: %v", f.fileId, err)
+		return syscall.EIO
 	}
+
+	f.modified = false
 	return 0
 }
 
@@ -340,7 +344,7 @@ func Mount(mountPoint string, trackerClient trackerservice.Client) (*fuse.Server
 	cricetaFS := NewCricetaFS(trackerClient, mountPoint)
 	server, err := fs.Mount(mountPoint, cricetaFS, &fs.Options{
 		MountOptions: fuse.MountOptions{
-			Debug:         true,
+			Debug:         false,
 			FsName:        "criceta",
 			DisableXAttrs: true,
 			AllowOther:    true,

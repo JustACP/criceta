@@ -181,6 +181,15 @@ func (sm *SliceManager) UpdateMapping() {
 
 }
 
+// Refresh 重新扫描 Slice 列表，重建区间映射并同步最高版本号。
+// 打开已有 Chunk 或合并 Slice 之后必须调用，否则 mapping 会落后于真实数据。
+func (sm *SliceManager) Refresh() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	sm.updateMapping()
+}
+
 func (sm *SliceManager) updateMapping() {
 
 	if sm.mappingVer != sm.HighestVersion || sm.mappingVer == 0 {
@@ -283,8 +292,8 @@ func (sm *SliceManager) AppendSlice(slice *Slice) error {
 
 func (sm *SliceManager) appendSlice(slice *Slice) error {
 
-	slice.mu.RLocker().Lock()
-	defer slice.mu.RLocker().Unlock()
+	slice.mu.RLock()
+	defer slice.mu.RUnlock()
 
 	// 检测是否属于对应的chunk
 	if slice.Header.ChunkId != sm.ChunkId {

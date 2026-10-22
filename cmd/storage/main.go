@@ -96,6 +96,11 @@ func main() {
 	}
 
 	var nodeId int64
+	capacity := int64(0)
+	if rawConfig.ChunkStorage.MaxStorageSize != nil {
+		capacity = *rawConfig.ChunkStorage.MaxStorageSize
+	}
+
 	// 检查配置中是否存在有效的ServerId
 	if rawConfig.ServerId > 0 {
 		// 直接使用ServerId作为NodeId
@@ -109,7 +114,7 @@ func main() {
 				Timestamp: time.Now().UnixNano(),
 			},
 			Address:  fmt.Sprintf("%s:%d", *rawConfig.ServerIP, rawConfig.Port),
-			Capacity: *rawConfig.ChunkStorage.MaxStorageSize,
+			Capacity: capacity,
 		}
 
 		registerResp, err := trackerClient.RegisterNode(context.Background(), registerReq)
@@ -126,6 +131,9 @@ func main() {
 		}
 		logs.Info("Updated config with new server ID")
 	}
+
+	// 注册得到的 NodeId 必须同步给 StorageNode，保证响应中的 NodeId 与 Tracker 一致
+	node.SetNodeID(uint64(nodeId))
 
 	// 启动心跳
 	heartbeat := storage.NewStorageNodeHeartbeat(

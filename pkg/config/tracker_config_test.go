@@ -29,7 +29,7 @@ func TestTrackerNodeConfig_ReadConfig(t *testing.T) {
 				},
 				"cluster_mode": "standalone",
 				"node_role":    "master",
-				"file_id_range": map[string]any{
+				"slot_range": map[string]any{
 					"start": int64(1),
 					"end":   int64(1000000),
 				},
@@ -128,7 +128,7 @@ func TestTrackerNodeConfig_ReadConfig(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "invalid_file_id_range",
+			name: "invalid_slot_range",
 			input: map[string]any{
 				"server_id":   int64(1),
 				"server_name": "tracker1",
@@ -142,7 +142,7 @@ func TestTrackerNodeConfig_ReadConfig(t *testing.T) {
 				},
 				"cluster_mode": "standalone",
 				"node_role":    "master",
-				"file_id_range": map[string]any{
+				"slot_range": map[string]any{
 					"start": int64(1000),
 					"end":   int64(100),
 				},
@@ -203,7 +203,7 @@ func TestTrackerNodeConfig_SaveConfig(t *testing.T) {
 				},
 				"cluster_mode": "standalone",
 				"node_role":    "master",
-				"file_id_range": map[string]any{
+				"slot_range": map[string]any{
 					"start": int64(1),
 					"end":   int64(1000000),
 				},

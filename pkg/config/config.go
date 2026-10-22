@@ -139,38 +139,18 @@ func GetInstanceConfig() *InstanceConfig {
 
 func GetRawConfig[T any]() (*T, error) {
 	instanceConf := GetInstanceConfig()
-	if instanceConf == nil {
+	if instanceConf == nil || instanceConf.ServerConfig == nil {
 		return nil, fmt.Errorf("failed to get config instance")
 	}
 
-	// 获取 ServerConfig 的实际类型
-	serverConfigType := reflect.TypeOf(instanceConf.ServerConfig)
-	var conf T
-	// 根据 T 的类型进行断言
-	switch any((*T)(nil)).(type) {
-	case *StorageNodeConfig:
-		tmpConf, ok := instanceConf.ServerConfig.(*StorageNodeConfig)
-		if !ok {
-			return nil, fmt.Errorf("failed to get raw config: expected *StorageNodeConfig, got %s", serverConfigType)
-		}
-		conf, ok = interface{}(*tmpConf).(T)
-		if !ok {
-			return nil, fmt.Errorf("failed to convert config to type %T", (*T)(nil))
-		}
-	case *TrackerNodeConfig:
-		tmpConf, ok := instanceConf.ServerConfig.(*TrackerNodeConfig)
-		if !ok {
-			return nil, fmt.Errorf("failed to get raw config: expected *TrackerNodeConfig, got %s", serverConfigType)
-		}
-		conf, ok = interface{}(*tmpConf).(T)
-		if !ok {
-			return nil, fmt.Errorf("failed to convert config to type %T", (*T)(nil))
-		}
-	default:
-		return nil, fmt.Errorf("unsupported type %T", any((*T)(nil)))
+	// 返回全局实例的真实指针，使调用方对配置的修改
+	// （例如持久化注册得到的 server_id）能够真正生效。
+	if conf, ok := any(instanceConf.ServerConfig).(*T); ok {
+		return conf, nil
 	}
 
-	return &conf, nil
+	return nil, fmt.Errorf("unsupported config type %T, instance holds %T",
+		any((*T)(nil)), instanceConf.ServerConfig)
 }
 
 var serverTypeNames = []string{"TRACKER", "STORAGE"}
@@ -271,7 +251,7 @@ func (lc *LogConfig) SaveConfig() map[string]any {
 		"level": lc.Level.String(),
 	}
 
-	if lc != nil {
+	if lc.FilePath != nil {
 		logOutput["file_path"] = *lc.FilePath
 	}
 
@@ -347,9 +327,9 @@ type ServerConfig struct {
 	ServerId       int64      `json:"server_id"`
 	ServerName     *string    `json:"server_name,omitempty"`
 	ServerIP       *string    `json:"server_ip,omitempty"`
-	Port           int32      `json:"port"`                       // RPC POrt
-	RaftPort       *int32     `json:"raft_port, omitempty"`       // Raft Port
-	MemberlistPort *int32     `json:"memberlist_port, omitempty"` // memberlist port
+	Port           int32      `json:"port"`                      // RPC POrt
+	RaftPort       *int32     `json:"raft_port,omitempty"`       // Raft Port
+	MemberlistPort *int32     `json:"memberlist_port,omitempty"` // memberlist port
 	ServerType     ServerType `json:"server_type"`
 }
 

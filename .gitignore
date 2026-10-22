@@ -20,6 +20,14 @@
 # Tmp file
 **/*tmp*
 
+# Runtime data (chunk files / heartbeat logs / service logs)
+/data/
+/data-*/
+/logs/
+
+# Generated RPC code (run `make generate` after changing idl/)
+/kitex_gen/
+
 # Go workspace file
 go.work
 go.work.sum

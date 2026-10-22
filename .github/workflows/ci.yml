@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 生成代码不纳入版本控制，流水线里按固定版本重新生成。
+  KITEX_VERSION: v0.13.1
+  THRIFTGO_VERSION: v0.4.1
+
+jobs:
+  build:
+    name: Build, Vet & Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Generate RPC code
+        run: make generate
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l ./cmd ./pkg ./test)
+          if [ -n "${unformatted}" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "${unformatted}"
+            exit 1
+          fi
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: |
+          go vet ./...
+          go vet -tags=e2e ./test/e2e
+
+      - name: Unit tests
+        run: go test -race ./...
+
+  e2e:
+    name: End-to-End
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Generate RPC code
+        run: make generate
+
+      - name: End-to-end tests
+        run: go test -tags=e2e -v -timeout 10m ./test/e2e

@@ -60,10 +60,11 @@ type FileMeta struct {
 
 // LockInfo 文件锁信息
 type LockInfo struct {
-	ClientId     uint64   `json:"client_id"`
-	LockType     LockType `json:"lock_type"`
-	AcquireTime  int64    `json:"acquire_time"`
-	LeaseTimeout int64    `json:"lease_timeout"`
+	ClientId     uint64                `json:"client_id"`
+	LockType     LockType              `json:"lock_type"`
+	AcquireTime  int64                 `json:"acquire_time"`
+	LeaseTimeout int64                 `json:"lease_timeout"`
+	LockedChunks []*base.ChunkLockInfo `json:"locked_chunks,omitempty"`
 }
 
 // LockType 锁类型

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -60,14 +62,16 @@ func (s *StorageNode) Init() error {
 
 	// 加载已有的chunk数据
 	chunkConfig := rawConfig.ChunkStorage
-	chunkDir := chunkConfig.FilePath
+	dataDir := chunkConfig.FilePath
+	// Chunk 元数据落在 <file_path>/meta 下，Slice 数据落在 <file_path>/slice 下
+	chunkDir := filepath.Join(dataDir, "meta")
 
 	// 确保目录存在
 	if err := os.MkdirAll(chunkDir, 0755); err != nil {
 		return fmt.Errorf("failed to create chunk directory: %v", err)
 	}
 
-	// 遍历目录加载chunk文件
+	// 遍历目录加载chunk
 	entries, err := os.ReadDir(chunkDir)
 	if err != nil {
 		return fmt.Errorf("failed to read chunk directory: %v", err)
@@ -77,7 +81,7 @@ func (s *StorageNode) Init() error {
 	defer s.chunkMux.Unlock()
 
 	for _, entry := range entries {
-		if entry.IsDir() {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".meta") {
 			continue
 		}
 
@@ -89,7 +93,7 @@ func (s *StorageNode) Init() error {
 		}
 
 		s.chunks[chk.Head.Id] = chk
-		logs.Info("Loaded chunk %d", chk.Head.Id)
+		logs.Info("Loaded chunk %d (file %d, %d slices)", chk.Head.Id, chk.Head.FileId, chk.GetSliceCount())
 	}
 
 	// 启动扫描器
@@ -97,6 +101,22 @@ func (s *StorageNode) Init() error {
 	// 启动压缩工作池
 	go s.startCompactWorkerPool()
 	return nil
+}
+
+// SetNodeID 更新本节点 ID。
+// 节点首次向 Tracker 注册后会拿到新的 NodeId，必须同步到这里，
+// 否则 Read/Write 响应里携带的 NodeId 会与 Tracker 记录的不一致。
+func (s *StorageNode) SetNodeID(nodeId uint64) {
+	s.chunkMux.Lock()
+	defer s.chunkMux.Unlock()
+	s.nodeId = nodeId
+}
+
+// NodeID 返回本节点 ID
+func (s *StorageNode) NodeID() uint64 {
+	s.chunkMux.RLock()
+	defer s.chunkMux.RUnlock()
+	return s.nodeId
 }
 
 func (s *StorageNode) Close() error {
@@ -193,11 +213,11 @@ func (s *StorageNode) compactWorker(workerId int) {
 }
 
 func (s *StorageNode) WriteChunk(ctx context.Context, req *storage.WriteChunkRequest) (*storage.WriteChunkResponse, error) {
+	// 只在查找/创建 Chunk 时持有全局锁，真正的写入由 Chunk 自身的锁保护，
+	// 避免一个大 Chunk 的写入阻塞整个节点。
 	s.chunkMux.Lock()
-	defer s.chunkMux.Unlock()
-
-	// 获取或创建chunk
 	chk, err := s.getOrCreateChunk(req.Meta)
+	s.chunkMux.Unlock()
 	if err != nil {
 		return nil, fmt.Errorf("get or create chunk failed: %v", err)
 	}
@@ -243,11 +263,10 @@ func (s *StorageNode) WriteChunk(ctx context.Context, req *storage.WriteChunkReq
 }
 
 func (s *StorageNode) ReadChunk(ctx context.Context, req *storage.ReadChunkRequest) (*storage.ReadChunkResponse, error) {
-	s.chunkMux.RLock()
-	defer s.chunkMux.RUnlock()
-
 	// 获取chunk
+	s.chunkMux.RLock()
 	chk, ok := s.chunks[uint64(req.ChunkId)]
+	s.chunkMux.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("chunk not found: %d", req.ChunkId)
 	}
@@ -282,12 +301,23 @@ func (s *StorageNode) ReadChunk(ctx context.Context, req *storage.ReadChunkReque
 	}, nil
 }
 
+// SyncChunk 处理副本同步请求。
+//
+// 支持两种模式：
+//   - 推送：请求里带 Data，直接落盘；
+//   - 拉取：请求只带 Meta + SourceNode，由本节点去源节点把整块数据拉回来。
+//
+// 数据总是整块写入 Chunk 内偏移 0；提供 CRC 时会先校验再落盘，
+// 校验失败不会覆盖本地已有的副本。
 func (s *StorageNode) SyncChunk(ctx context.Context, req *storage.SyncChunkRequest) (*storage.SyncChunkResponse, error) {
-	s.chunkMux.Lock()
-	defer s.chunkMux.Unlock()
+	if req.Meta == nil {
+		return nil, fmt.Errorf("sync chunk: meta is nil")
+	}
 
 	// 创建或获取目标chunk
+	s.chunkMux.Lock()
 	chk, err := s.getOrCreateChunk(req.Meta)
+	s.chunkMux.Unlock()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create target chunk: %v", err)
 	}
@@ -297,38 +327,144 @@ func (s *StorageNode) SyncChunk(ctx context.Context, req *storage.SyncChunkReque
 		return nil, fmt.Errorf("file id mismatch: expected %d, got %d", chk.Head.FileId, req.Meta.FileId)
 	}
 
-	// 写入同步数据
-	if _, err := chk.WriteAt(req.Data, int64(req.Meta.Offset)); err != nil {
+	data := req.Data
+	if len(data) == 0 {
+		if req.SourceNode == nil {
+			return nil, fmt.Errorf("sync chunk: neither data nor source node provided")
+		}
+		data, err = s.fetchChunkFromSource(ctx, req.Meta, req.SourceNode)
+		if err != nil {
+			return nil, fmt.Errorf("fetch chunk %d from source node %d failed: %w", req.Meta.Id, req.SourceNode.NodeId, err)
+		}
+	}
+
+	if len(data) == 0 {
+		return nil, fmt.Errorf("sync chunk: empty payload for chunk %d", req.Meta.Id)
+	}
+
+	// 校验 CRC：只信任通过校验的数据，且必须在落盘前完成，
+	// 避免坏数据把本地已有的好副本覆盖掉。
+	if req.Meta.Crc != nil && *req.Meta.Crc != "" {
+		expected, ok := parseCRC(*req.Meta.Crc)
+		if !ok {
+			return nil, fmt.Errorf("invalid crc in chunk meta: %s", *req.Meta.Crc)
+		}
+		actual := utils.UpdateCRC32(0, data)
+		if actual != expected {
+			return nil, fmt.Errorf("crc mismatch for chunk %d: expected=%08x, actual=%08x", req.Meta.Id, expected, actual)
+		}
+	}
+
+	// 副本总是整块写入：偏移固定为 Chunk 内 0
+	if _, err := chk.WriteAt(data, 0); err != nil {
 		return nil, fmt.Errorf("write sync data failed: %v", err)
 	}
 
-	// 更新chunk版本
-	chk.Head.Version = uint64(*req.Meta.Version)
-	chk.Head.ModifyAt = *req.Meta.ModifyAt
+	version, modifyAt := uint64(0), int64(0)
+	if req.Meta.Version != nil {
+		version = uint64(*req.Meta.Version)
+	}
+	if req.Meta.ModifyAt != nil {
+		modifyAt = *req.Meta.ModifyAt
+	}
+	if err := chk.ApplyMeta(version, modifyAt); err != nil {
+		return nil, fmt.Errorf("update chunk meta failed: %v", err)
+	}
 
 	return &storage.SyncChunkResponse{
 		Base: &base.BaseResponse{
-			Code:    0,
-			Message: "success",
+			Code:      base.SUCCESS,
+			Message:   "success",
+			Timestamp: time.Now().UnixNano(),
 		},
 		Meta: &storage.ChunkMeta{
 			Id:       int64(chk.Head.Id),
 			FileId:   int64(chk.Head.FileId),
 			Version:  utils.Ptr(int64(chk.Head.Version)),
 			Offset:   int64(chk.Head.Offset),
-			Size:     int64(chk.Head.Range.Size),
+			Size:     int64(chk.Head.Size),
 			NodeId:   utils.Ptr(int64(s.nodeId)),
 			Status:   utils.Ptr(base.ChunkStatus(chk.Head.Status)),
+			Crc:      utils.Ptr(fmt.Sprintf("%d", chk.Head.CRC)),
 			CreateAt: &chk.Head.CreateAt,
 			ModifyAt: &chk.Head.ModifyAt,
 		},
 	}, nil
 }
 
+// fetchChunkFromSource 从源存储节点拉取整个 Chunk 的数据
+func (s *StorageNode) fetchChunkFromSource(ctx context.Context, meta *storage.ChunkMeta, source *storage.NodeInfo) ([]byte, error) {
+	if source == nil || source.Address == "" {
+		return nil, fmt.Errorf("invalid source node")
+	}
+
+	sourceCli, err := storageservice.NewClient(
+		fmt.Sprintf("storage-%d", source.NodeId),
+		client.WithHostPorts(source.Address),
+		client.WithRPCTimeout(time.Minute),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create source client failed: %w", err)
+	}
+
+	version := int64(0)
+	if meta.Version != nil {
+		version = *meta.Version
+	}
+
+	readCtx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+
+	resp, err := sourceCli.ReadChunk(readCtx, &storage.ReadChunkRequest{
+		Base: &base.BaseRequest{
+			RequestId: time.Now().UnixNano(),
+			Timestamp: time.Now().UnixNano(),
+		},
+		ChunkId: meta.Id,
+		Version: version,
+		FileId:  meta.FileId,
+		Offset:  0, // chunk 内偏移
+		Size:    meta.Size,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("read chunk from source failed: %w", err)
+	}
+	if resp.Base != nil && resp.Base.Code != base.SUCCESS {
+		return nil, fmt.Errorf("source returned error: %s", resp.Base.Message)
+	}
+
+	return resp.Data, nil
+}
+
+// parseCRC 兼容十进制与十六进制两种 CRC 字符串表示
+func parseCRC(crc string) (uint32, bool) {
+	crc = strings.TrimSpace(crc)
+	if v, err := strconv.ParseUint(crc, 10, 32); err == nil {
+		return uint32(v), true
+	}
+	if v, err := strconv.ParseUint(strings.TrimPrefix(strings.ToLower(crc), "0x"), 16, 32); err == nil {
+		return uint32(v), true
+	}
+	return 0, false
+}
+
 func (s *StorageNode) getOrCreateChunk(meta *storage.ChunkMeta) (*chunk.SliceBasedChunk, error) {
+	// 调用方必须持有 s.chunkMux
+	if meta == nil {
+		return nil, fmt.Errorf("chunk meta is nil")
+	}
+
 	// 检查是否已存在
 	if chk, ok := s.chunks[uint64(meta.Id)]; ok {
 		return chk, nil
+	}
+
+	version, size := uint64(0), uint64(0)
+	if meta.Version != nil {
+		version = uint64(*meta.Version)
+	}
+	if meta.Size > 0 {
+		size = uint64(meta.Size)
 	}
 
 	// 创建新的chunk
@@ -336,11 +472,17 @@ func (s *StorageNode) getOrCreateChunk(meta *storage.ChunkMeta) (*chunk.SliceBas
 		uint64(meta.Id),
 		uint64(meta.FileId),
 		uint64(meta.Offset),
-		chunk.WithVersion(uint64(*meta.Version)),
-		chunk.WithRangeSize(uint64(meta.Size)),
+		chunk.WithVersion(version),
+		chunk.WithRangeSize(size),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("create chunk failed: %v", err)
+		// 元数据已存在（例如节点重启后首次写入）时改为打开已有 Chunk，绝不覆盖
+		existing, openErr := chunk.OpenChunkByPath(chunk.ChunkMetaFilePath(uint64(meta.FileId), uint64(meta.Id)))
+		if openErr == nil {
+			s.chunks[uint64(meta.Id)] = existing
+			return existing, nil
+		}
+		return nil, fmt.Errorf("create chunk failed: %v (open existing chunk also failed: %v)", err, openErr)
 	}
 
 	s.chunks[uint64(meta.Id)] = chk
@@ -694,7 +836,9 @@ func (s *StorageNode) RecoverChunk(ctx context.Context, req *storage.RecoverChun
 	}
 
 	// 在本地创建chunk
+	s.chunkMux.Lock()
 	chunk, err := s.getOrCreateChunk(req.Meta)
+	s.chunkMux.Unlock()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create local chunk: %v", err)
 	}
