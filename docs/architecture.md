@@ -99,20 +99,28 @@ sequenceDiagram
 sequenceDiagram
     participant C as Client
     participant T as Tracker
-    participant S as Storage
+    participant S1 as Storage（主）
+    participant S2 as Storage（副本）
 
     C->>T: GetFile(fileID)
     T-->>C: FileMeta（Chunk 列表 + 副本）
-    C->>C: 构建区间映射（按 offset / version）
-    loop 每个覆盖的 Chunk
-        C->>S: ReadChunk(chunkID, offset, size)
-        S->>S: 从 Slice 映射读取最新版本
-        S-->>C: data
+    C->>C: 按版本仲裁，构建不重叠区间
+    loop 每个区间
+        C->>S1: ReadChunk(chunkID, offset, size)
+        alt 主副本失败
+            S1--x C: error / 短读
+            C->>S2: ReadChunk（回退到 VALID 副本）
+            S2-->>C: data
+        else 正常
+            S1-->>C: data
+        end
     end
     C->>C: 空洞补零、拼接结果
 ```
 
-当前实现总是从 Chunk 的**主节点**读取，副本只用于同步与校验。读副本故障转移在路线图中。
+区间仲裁规则：同一个区间有多个版本时版本号大的覆盖小的（按版本从高到低依次认领），
+因此覆盖写之后读到的永远是最新数据。读取时按「主副本 → 其它 `VALID` 副本」的顺序尝试，
+单个副本不可用不会导致读失败；返回长度与请求不一致也会触发回退。
 
 ## 6. 副本与一致性
 
@@ -150,10 +158,54 @@ Storage 节点在配置的 `chunk_storage.file_path` 下维护两个目录：
 | Storage 重启 | 从 `meta/` 恢复 Chunk 索引与 Slice 映射 |
 | Tracker 重启 | 从 `<data_dir>/tracker_state.json` 恢复文件、Chunk 与副本状态；节点心跳与写租约重新建立 |
 
-## 9. 已知限制
+## 9. Storage → Tracker 状态收敛
+
+Storage 先落盘、再把结果告诉 Tracker。如果进程在两步之间中断（客户端崩溃、网络抖动、
+Tracker 重启），两边就会不一致：
+
+| 类型 | 表现 | 后果 |
+| --- | --- | --- |
+| A. 孤儿 Chunk | Storage 有数据，Tracker 不知道 | 数据读不到，且长期占用空间 |
+| B. 悬空引用 | Tracker 有映射，Storage 没有数据 | 读到该 Chunk 时失败 |
+| C. 副本状态过期 | 副本已同步，但状态回写丢失 | Tracker 一直显示 `SYNCING` |
+
+**原则**：Storage 是自己「持有什么」的权威，Tracker 是「文件 → Chunk」映射的权威。
+任何一方都不能单方面推断对方的状态，只能通过可重放的报告收敛。
+
+**协议**
+
+1. **变更日志 + 至少一次上报**：Storage 每次本地变更（写入 / 副本落盘 / 删除）在数据
+   `fsync` 之后追加一条 `{seq, chunkID, fileID, version, size, crc, op}` 到本地日志，
+   然后调用 Tracker 的 `ReportChunkEvents(events, seq)`。
+2. **按节点顺序、幂等应用**：Tracker 为每个 Storage 节点记录 `last_seq`，只接受更大的
+   `seq`；事件按 `(chunkID, version)` 去重，版本号不更大的一律忽略，避免旧报告覆盖新状态。
+3. **ACK 后裁剪**：Tracker 返回已确认的 `acked_seq`，Storage 才能删除对应日志；失败时
+   退避重试，重启后先重发未确认事件。
+4. **启动 & 周期对账**：Storage 启动时以及每隔一段时间（如 5 分钟）上报库存摘要
+   （chunkID / version / CRC 的列表）。Tracker 用它：
+   - 发现未知 Chunk → 若文件仍存在则采纳（补映射并重算文件大小），否则进入孤儿隔离区；
+   - 发现映射中的 Chunk 在所有副本上都不存在 → 标记 `MISSING`，触发修复或从可读集合剔除；
+   - 发现副本版本低于记录 → 标记副本过期，交给后台重新同步。
+5. **孤儿回收**：孤儿 Chunk 超过 TTL 后由 Tracker 下发删除指令（标记 → 确认 → 删除），
+   避免误删尚未提交但仍在重试的写入。
+
+```mermaid
+sequenceDiagram
+    participant S as Storage
+    participant T as Tracker
+
+    S->>S: 落盘 + 追加变更日志(seq)
+    S->>T: ReportChunkEvents(events, seq)
+    T->>T: 按 (chunkID, version) 幂等应用
+    T-->>S: acked_seq
+    S->>S: 裁剪 <= acked_seq 的日志
+    Note over S,T: 周期对账：库存摘要 → 采纳 / 标记 MISSING / 触发修复
+```
+
+## 10. 已知限制
 
 1. 元数据快照只在本机，尚未接入 Raft 日志复制，多 Tracker 之间仍可能不一致；
-2. 读路径没有版本选择和副本故障转移；
-3. 没有容量配额、孤儿 Chunk GC 与后台副本修复；
+2. Storage 变更上报与库存对账尚未实现（协议见上一节）；
+3. 没有容量配额与孤儿 Chunk GC；
 4. RPC 错误多以 Go `error` 返回，错误码体系尚未统一；
 5. 客户端与服务端之间没有 TLS / 鉴权。

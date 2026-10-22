@@ -48,6 +48,7 @@ type cluster struct {
 	trackerConfig string
 	trackerProc   *exec.Cmd
 	storageAddr   map[int64]string
+	storageProcs  map[int64]*exec.Cmd
 	procs         []*exec.Cmd
 	logFiles      map[string]string
 }
@@ -141,6 +142,45 @@ func TestClusterWriteReplicateAndRewrite(t *testing.T) {
 	afterRestart, err := reader.ReadFile(ctx, file.Id, 0, fileSize)
 	require.NoError(t, err)
 	requireSameBytes(t, updated, afterRestart, "after tracker restart")
+
+	// 6. Losing the primary of a chunk must not break reads: the client has to
+	//    fall back to a healthy replica.
+	victim := int64(0)
+	for _, chunk := range meta.Chunks {
+		victim = *chunk.NodeId
+		break
+	}
+	require.NotZero(t, victim)
+	c.stopStorage(victim)
+
+	degraded, err := reader.ReadFile(ctx, file.Id, 0, fileSize)
+	require.NoError(t, err)
+	requireSameBytes(t, updated, degraded, "read after primary failure")
+}
+
+// stopStorage 停止指定 Storage 进程，模拟节点宕机。
+func (c *cluster) stopStorage(nodeID int64) {
+	c.t.Helper()
+
+	cmd, ok := c.storageProcs[nodeID]
+	require.True(c.t, ok, "storage node %d is not running", nodeID)
+
+	require.NoError(c.t, cmd.Process.Signal(os.Interrupt))
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = cmd.Process.Wait()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		_ = cmd.Process.Kill()
+		c.t.Fatalf("storage node %d did not stop within 15s", nodeID)
+	}
+
+	delete(c.storageProcs, nodeID)
 }
 
 func newTrackerClient(t *testing.T, addr string) trackerservice.Client {
@@ -165,11 +205,12 @@ func startCluster(t *testing.T, n int) *cluster {
 	require.NoError(t, err)
 
 	c := &cluster{
-		t:           t,
-		root:        root,
-		workDir:     t.TempDir(),
-		storageAddr: make(map[int64]string),
-		logFiles:    make(map[string]string),
+		t:            t,
+		root:         root,
+		workDir:      t.TempDir(),
+		storageAddr:  make(map[int64]string),
+		storageProcs: make(map[int64]*exec.Cmd),
+		logFiles:     make(map[string]string),
 	}
 
 	for _, dir := range []string{"bin", "logs"} {
@@ -206,6 +247,7 @@ func startCluster(t *testing.T, n int) *cluster {
 		))
 
 		c.start(fmt.Sprintf("storage-%d", i+1), storageBin, "-config", configPath)
+		c.storageProcs[nodeID] = c.procs[len(c.procs)-1]
 		addr := fmt.Sprintf("127.0.0.1:%d", port)
 		c.storageAddr[nodeID] = addr
 		waitForPort(t, addr)

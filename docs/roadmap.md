@@ -30,8 +30,10 @@
 
 - [x] **Tracker 元数据持久化**：文件、Chunk、副本状态写入 `<data_dir>/tracker_state.json`
       （临时文件 + fsync + rename），启动时恢复
+- [x] **读路径版本仲裁与副本故障转移**：按版本选择区间，主副本失败自动切换 `VALID` 副本
+- [ ] **Storage → Tracker 变更上报与库存对账**：变更日志 + ACK 裁剪 + 周期对账，
+      收敛“数据已落盘但 Tracker 未收到”的偏差（协议见 architecture.md 第 9 节）
 - [ ] **Raft 日志复制**：把元数据变更做成状态机命令，接入成熟的 Raft 实现（如 `hashicorp/raft`）
-- [ ] **读路径版本选择与副本故障转移**：主副本不可用时自动切换
 - [ ] **后台副本修复**：周期性扫描副本不足的 Chunk 并补齐
 
 ## 后续（P2）

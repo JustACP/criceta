@@ -369,17 +369,44 @@ func NewReadProcessor(ctx context.Context, client *Client, size uint64) *ReadPro
 	}
 }
 
-func (rp *ReadProcessor) ProcessChunkData(chunk *chunk.ChunkMeta, offset uint64, size uint64, isGap bool) error {
+func (rp *ReadProcessor) ProcessChunkData(chunkMeta *chunk.ChunkMeta, offset uint64, size uint64, isGap bool) error {
 	if isGap {
-		copy(rp.result[rp.written:rp.written+size], make([]byte, size))
+		// result 已按 0 初始化，直接跳过这段即可
 		rp.written += size
 		return nil
 	}
 
-	// 从存储节点读取数据
-	cli, err := rp.getStorageClient(chunk.NodeId)
+	// 先读主副本，失败时依次切换到其它状态为 VALID 的副本
+	candidates := make([]uint64, 0, len(chunkMeta.Replicas)+1)
+	candidates = append(candidates, chunkMeta.NodeId)
+	for _, nodeId := range chunkMeta.Replicas {
+		if nodeId != chunkMeta.NodeId {
+			candidates = append(candidates, nodeId)
+		}
+	}
+
+	var lastErr error
+	for _, nodeId := range candidates {
+		data, err := rp.readFromNode(nodeId, chunkMeta, offset, size)
+		if err != nil {
+			lastErr = err
+			logs.Warn("Read chunk %d from node %d failed, trying next replica: %v", chunkMeta.Id, nodeId, err)
+			continue
+		}
+
+		copy(rp.result[rp.written:], data)
+		rp.written += size
+		return nil
+	}
+
+	return fmt.Errorf("read chunk %d failed on all %d replica(s): %w", chunkMeta.Id, len(candidates), lastErr)
+}
+
+// readFromNode 从指定节点读取 Chunk 的一段数据，并校验返回长度。
+func (rp *ReadProcessor) readFromNode(nodeId uint64, chunkMeta *chunk.ChunkMeta, offset, size uint64) ([]byte, error) {
+	cli, err := rp.getStorageClient(nodeId)
 	if err != nil {
-		return fmt.Errorf("get storage client failed: %v", err)
+		return nil, fmt.Errorf("get storage client for node %d failed: %w", nodeId, err)
 	}
 
 	resp, err := cli.ReadChunk(rp.ctx, &storage.ReadChunkRequest{
@@ -387,19 +414,23 @@ func (rp *ReadProcessor) ProcessChunkData(chunk *chunk.ChunkMeta, offset uint64,
 			RequestId: time.Now().UnixNano(),
 			Timestamp: time.Now().UnixNano(),
 		},
-		ChunkId: int64(chunk.Id),
-		Version: int64(chunk.Version),
-		FileId:  int64(chunk.FileId),
-		Offset:  int64(offset) - int64(chunk.Offset), // 转换为chunk内的偏移量
+		ChunkId: int64(chunkMeta.Id),
+		Version: int64(chunkMeta.Version),
+		FileId:  int64(chunkMeta.FileId),
+		Offset:  int64(offset) - int64(chunkMeta.Offset), // 转换为 chunk 内偏移
 		Size:    int64(size),
 	})
 	if err != nil {
-		return fmt.Errorf("read chunk failed: %v", err)
+		return nil, err
+	}
+	if resp.Base != nil && resp.Base.Code != base.SUCCESS {
+		return nil, fmt.Errorf("node %d returned code %d: %s", nodeId, resp.Base.Code, resp.Base.Message)
+	}
+	if uint64(len(resp.Data)) != size {
+		return nil, fmt.Errorf("node %d returned %d bytes, want %d", nodeId, len(resp.Data), size)
 	}
 
-	copy(rp.result[rp.written:], resp.Data)
-	rp.written += size
-	return nil
+	return resp.Data, nil
 }
 
 func (rp *ReadProcessor) getStorageClient(nodeId uint64) (storageservice.Client, error) {
@@ -438,17 +469,28 @@ func (c *Client) ReadFile(ctx context.Context, fileId int64, offset int64, size 
 	cm := chunk.NewChunkManager(uint64(fileId))
 
 	for _, chunkMeta := range fileResp.Meta.Chunks {
-		cm.AddChunk(&chunk.ChunkMeta{
+		replicas := make([]uint64, 0, len(fileResp.Meta.ChunkReplicas[chunkMeta.Id]))
+		for _, replica := range fileResp.Meta.ChunkReplicas[chunkMeta.Id] {
+			if replica.Status != int32(base.ChunkStatus_VALID) {
+				continue
+			}
+			replicas = append(replicas, uint64(replica.NodeId))
+		}
+
+		if err := cm.AddChunk(&chunk.ChunkMeta{
 			Id:       uint64(chunkMeta.Id),
 			FileId:   uint64(chunkMeta.FileId),
 			Version:  uint64(*chunkMeta.Version),
 			Offset:   uint64(chunkMeta.Offset),
 			Size:     uint64(chunkMeta.Size),
 			NodeId:   uint64(*chunkMeta.NodeId),
+			Replicas: replicas,
 			Status:   chunk.ChunkStatus(*chunkMeta.Status),
 			CreateAt: *chunkMeta.CreateAt,
 			UpdateAt: *chunkMeta.ModifyAt,
-		})
+		}); err != nil {
+			return nil, fmt.Errorf("add chunk %d failed: %w", chunkMeta.Id, err)
+		}
 	}
 
 	processor := NewReadProcessor(ctx, c, uint64(size))
