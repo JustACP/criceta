@@ -89,13 +89,33 @@ func TestReportChunkEventsIgnoresUnknownChunk(t *testing.T) {
 
 	node.fileMux.RLock()
 	_, exists := node.files[12345]
+	_, orphaned := node.orphans[999]
 	node.fileMux.RUnlock()
 	assert.False(t, exists, "reports must not create file mappings")
-
-	node.reportMux.RLock()
-	_, orphaned := node.orphans[999]
-	node.reportMux.RUnlock()
 	assert.True(t, orphaned)
+}
+
+// TestCommitClearsOrphan 提交之后，之前被上报为孤儿的记录必须被清除，
+// 避免正常写入被长期误判为孤儿。
+func TestCommitClearsOrphan(t *testing.T) {
+	node := newPersistentTestNode(t, t.TempDir())
+
+	// 报告先于提交到达：此时 Tracker 还不认识这个 Chunk
+	reportFrom(t, node, 3, reportEvent(1, tracker.ChunkReportOp_UPSERT, 777, 0, 1))
+
+	node.fileMux.RLock()
+	_, orphaned := node.orphans[777]
+	node.fileMux.RUnlock()
+	require.True(t, orphaned)
+
+	// 客户端随后创建文件并提交同一个 Chunk
+	fileID := createTestFile(t, node, "orphan.bin")
+	commitTestChunk(t, node, fileID, 777)
+
+	node.fileMux.RLock()
+	_, stillOrphan := node.orphans[777]
+	node.fileMux.RUnlock()
+	assert.False(t, stillOrphan)
 }
 
 // TestApplyInventoryPromotesReplica 主副本数据丢失时，把有效副本提升为主副本。

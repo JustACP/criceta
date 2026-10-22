@@ -410,6 +410,9 @@ func (t *TrackerNode) CommitChunk(ctx context.Context, req *tracker.CommitChunkR
 
 	file.ChunkReplicas[chunkId] = replicas
 
+	// 提交之后该 Chunk 已进入正常映射，之前由上报登记为“孤儿”的记录作废
+	delete(t.orphans, chunkId)
+
 	if len(replicas) < minReplicaCount {
 		logs.Warn("Chunk %d of file %d only got %d replica target(s), want %d",
 			chunkId, req.Chunk.FileId, len(replicas), minReplicaCount)
