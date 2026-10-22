@@ -363,6 +363,35 @@ struct RestoreFromBackupResponse {
     2: list<FileMeta> restored_files
 }
 
+// Chunk 变更上报：Storage 在本地落地后把变更推给 Tracker，
+// 用于收敛“数据已写入但 Tracker 未收到”的偏差。
+enum ChunkReportOp {
+    UPSERT = 0,   // 新增或更新了一个 Chunk 版本
+    DELETE = 1,   // 本地删除了该 Chunk
+}
+
+struct ChunkReport {
+    1: i64 seq              // Storage 节点内单调递增的序号
+    2: ChunkReportOp op
+    3: i64 chunk_id
+    4: i64 file_id
+    5: i64 version
+    6: i64 size
+    7: string crc
+    8: i64 timestamp
+}
+
+struct ReportChunkEventsRequest {
+    1: base.BaseRequest base
+    2: i64 node_id
+    3: list<ChunkReport> events
+}
+
+struct ReportChunkEventsResponse {
+    1: base.BaseResponse base
+    2: i64 acked_seq        // 已确认的最大序号，Storage 可据此裁剪本地日志
+}
+
 service TrackerService {
     CreateFileResponse CreateFile(1: CreateFileRequest req)
     AllocateChunkResponse AllocateChunk(1: AllocateChunkRequest req)
@@ -379,6 +408,9 @@ service TrackerService {
     HealthCheckResponse HealthCheck(1: HealthCheckRequest req)
     GetNodesResponse GetNodes(1: GetNodesRequest req)
     UpdateNodeStatusResponse UpdateNodeStatus(1: UpdateNodeStatusRequest req)
+
+    // Storage 变更上报
+    ReportChunkEventsResponse ReportChunkEvents(1: ReportChunkEventsRequest req)
     
     // Raft 共识相关接口
     RequestVoteResponse RequestVote(1: RequestVoteRequest req)

@@ -14,6 +14,7 @@ import (
 	"github.com/JustACP/criceta/kitex_gen/criceta/base"
 	"github.com/JustACP/criceta/kitex_gen/criceta/storage"
 	"github.com/JustACP/criceta/kitex_gen/criceta/storage/storageservice"
+	"github.com/JustACP/criceta/kitex_gen/criceta/tracker/trackerservice"
 	"github.com/JustACP/criceta/pkg/chunk"
 	"github.com/JustACP/criceta/pkg/common/logs"
 	"github.com/JustACP/criceta/pkg/common/utils"
@@ -41,6 +42,15 @@ type StorageNode struct {
 	compactTasks   chan CompactTask // 压缩任务通道
 	compactWorkers sync.WaitGroup   // 压缩工作协程等待组
 	stopChan       chan struct{}    // 停止信号通道
+
+	// 变更上报：本地日志 + 向 Tracker 推送
+	report         *reportJournal
+	trackerCli     trackerservice.Client
+	reportCh       chan struct{}
+	reportStop     chan struct{}
+	reportOnce     sync.Once
+	reportStopOnce sync.Once
+	reportMu       sync.RWMutex
 }
 
 func NewStorageNode() *StorageNode {
@@ -48,6 +58,8 @@ func NewStorageNode() *StorageNode {
 		chunks:       make(map[uint64]*chunk.SliceBasedChunk),
 		compactTasks: make(chan CompactTask, maxCompactWorkers*2), // 任务通道缓冲区大小为工作协程数的2倍
 		stopChan:     make(chan struct{}),
+		reportCh:     make(chan struct{}, 1),
+		reportStop:   make(chan struct{}),
 	}
 }
 
@@ -100,6 +112,14 @@ func (s *StorageNode) Init() error {
 	go s.startChunkScanner()
 	// 启动压缩工作池
 	go s.startCompactWorkerPool()
+
+	// 打开变更日志（未上报的事件会在拿到 Tracker 客户端后补发）
+	journal, err := openReportJournal(filepath.Join(dataDir, reportJournalName))
+	if err != nil {
+		return fmt.Errorf("open report journal: %v", err)
+	}
+	s.report = journal
+
 	return nil
 }
 
@@ -120,6 +140,10 @@ func (s *StorageNode) NodeID() uint64 {
 }
 
 func (s *StorageNode) Close() error {
+	s.reportStopOnce.Do(func() {
+		close(s.reportStop)
+	})
+
 	// 发送停止信号
 	close(s.stopChan)
 	// 等待所有压缩工作完成
@@ -240,6 +264,7 @@ func (s *StorageNode) WriteChunk(ctx context.Context, req *storage.WriteChunkReq
 
 	// 更新chunk状态
 	chk.Head.ModifyAt = time.Now().UnixNano()
+	s.enqueueReport(reportOpUpsert, headSnapshot(chk.SnapshotHead()))
 
 	return &storage.WriteChunkResponse{
 		Base: &base.BaseResponse{
@@ -370,6 +395,7 @@ func (s *StorageNode) SyncChunk(ctx context.Context, req *storage.SyncChunkReque
 	if err := chk.ApplyMeta(version, modifyAt); err != nil {
 		return nil, fmt.Errorf("update chunk meta failed: %v", err)
 	}
+	s.enqueueReport(reportOpUpsert, headSnapshot(chk.SnapshotHead()))
 
 	return &storage.SyncChunkResponse{
 		Base: &base.BaseResponse{
@@ -793,10 +819,12 @@ func (s *StorageNode) MigrateChunk(ctx context.Context, req *storage.MigrateChun
 	}
 
 	// 迁移成功后删除本地chunk
+	head := headSnapshot(chunk.SnapshotHead())
 	delete(s.chunks, uint64(req.Meta.Id))
 	if err := chunk.Close(); err != nil {
 		logs.Error("Failed to close chunk %d: %v", req.Meta.Id, err)
 	}
+	s.enqueueReport(reportOpDelete, head)
 
 	return &storage.MigrateChunkResponse{
 		Base: &base.BaseResponse{

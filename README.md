@@ -156,12 +156,13 @@ docs/                架构、配置、开发与测试文档
 - Chunk 切分与覆盖写（Slice 版本化）；
 - 读路径按版本仲裁，主副本故障时自动切换副本；
 - 拉模式副本同步与 CRC 校验；
+- Storage 变更上报（本地日志 + ACK 裁剪）与周期库存对账；
 - 写租约与过期回收；
 - Storage 重启后从磁盘恢复 Chunk；
 - Tracker 重启后从 `tracker_state.json` 恢复文件与 Chunk 元数据。
 
-仍在路线图中的能力：Storage → Tracker 变更上报与库存对账、Raft 日志复制与元数据状态机、
-容量配额与孤儿 Chunk 回收、统一错误码与指标。详见 [docs/roadmap.md](docs/roadmap.md)。
+仍在路线图中的能力：Raft 日志复制与元数据状态机、孤儿 Chunk TTL 回收、后台副本修复、
+容量配额、统一错误码与指标。详见 [docs/roadmap.md](docs/roadmap.md)。
 
 ## 许可证
 

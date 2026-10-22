@@ -197,6 +197,24 @@ struct RestoreChunksResponse {
     2: map<i64, ChunkMeta> restored_chunks
 }
 
+// 库存条目：用于 Tracker 与 Storage 之间的状态对账
+struct ChunkInventoryEntry {
+    1: i64 chunk_id
+    2: i64 file_id
+    3: i64 version
+    4: i64 size
+    5: string crc
+}
+
+struct GetInventoryRequest {
+    1: base.BaseRequest base
+}
+
+struct GetInventoryResponse {
+    1: base.BaseResponse base
+    2: list<ChunkInventoryEntry> chunks
+}
+
 service StorageService {
     WriteChunkResponse WriteChunk(1: WriteChunkRequest req)
     ReadChunkResponse ReadChunk(1: ReadChunkRequest req)
@@ -206,6 +224,9 @@ service StorageService {
     GetChunkStatusResponse GetChunkStatus(1: GetChunkStatusRequest req)
     MigrateChunkResponse MigrateChunk(1: MigrateChunkRequest req)
     GetNodeLoadResponse GetNodeLoad(1: GetNodeLoadRequest req)
+
+    // 库存对账
+    GetInventoryResponse GetInventory(1: GetInventoryRequest req)
     
     // 快照相关接口
     CreateSnapshotResponse CreateSnapshot(1: CreateSnapshotRequest req)

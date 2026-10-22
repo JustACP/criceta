@@ -499,3 +499,11 @@ func (sc *SliceBasedChunk) GetSliceCount() int {
 	defer sc.mu.RUnlock()
 	return len(sc.SliceManager.Slices)
 }
+
+// SnapshotHead 返回 ChunkHead 的一致性副本，供库存上报等并发读取场景使用。
+func (sc *SliceBasedChunk) SnapshotHead() ChunkHead {
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+
+	return *sc.Head
+}

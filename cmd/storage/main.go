@@ -135,6 +135,9 @@ func main() {
 	// 注册得到的 NodeId 必须同步给 StorageNode，保证响应中的 NodeId 与 Tracker 一致
 	node.SetNodeID(uint64(nodeId))
 
+	// 开始把本地 Chunk 变更上报给 Tracker（失败会重试，重启后补发）
+	node.StartReporting(trackerClient)
+
 	// 启动心跳
 	heartbeat := storage.NewStorageNodeHeartbeat(
 		nodeId,

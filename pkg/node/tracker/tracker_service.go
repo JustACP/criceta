@@ -44,6 +44,11 @@ type TrackerNode struct {
 	persistOnce     sync.Once
 	persistStopOnce sync.Once
 	persistMux      sync.Mutex
+
+	// Storage 变更上报与库存对账
+	reportMux   sync.RWMutex
+	nodeReports map[uint64]*nodeReportState
+	orphans     map[uint64]*orphanChunk
 }
 
 // fileWriteLease 文件写租约。
@@ -89,6 +94,8 @@ func newTrackerNode(dataDir string) *TrackerNode {
 		dataDir:      dataDir,
 		persistCh:    make(chan struct{}, 1),
 		persistStop:  make(chan struct{}),
+		nodeReports:  make(map[uint64]*nodeReportState),
+		orphans:      make(map[uint64]*orphanChunk),
 	}
 	node.initRaft()
 	return node
@@ -597,6 +604,7 @@ func (t *TrackerNode) Init() error {
 
 	t.startPersister()
 	t.StartNodeHealthCheck()
+	go t.runReconciler()
 	return nil
 }
 

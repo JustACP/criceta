@@ -116,6 +116,11 @@ func TestClusterWriteReplicateAndRewrite(t *testing.T) {
 		}
 	}
 
+	// 4. Storage change reports must be acknowledged and trimmed: a non-empty
+	//    journal means the tracker is not converging with the data plane.
+	require.Eventually(t, c.reportsAcknowledged, 30*time.Second, 500*time.Millisecond,
+		"storage report journals were not acknowledged by the tracker")
+
 	// 4. A different client must be able to rewrite the file. If the previous
 	//    writer still held its lease, the commit would be rejected.
 	rewriter := nodeclient.NewClient(trackerCli)
@@ -194,6 +199,30 @@ func newTrackerClient(t *testing.T, addr string) trackerservice.Client {
 	require.NoError(t, err)
 
 	return cli
+}
+
+// reportsAcknowledged 检查所有 Storage 的变更日志是否已被 Tracker 确认并裁剪。
+// 日志为空说明“本地已落盘 → 上报 → ACK → 裁剪”这条链路走通了。
+func (c *cluster) reportsAcknowledged() bool {
+	for i := 1; i <= storageNodeNum; i++ {
+		path := filepath.Join(c.workDir, fmt.Sprintf("storage-%d", i), "report.journal")
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return false
+		}
+
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.TrimSpace(line) != "" {
+				return false
+			}
+		}
+	}
+
+	return true
 }
 
 // startCluster builds the binaries, writes configs into a temporary directory

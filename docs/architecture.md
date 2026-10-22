@@ -202,10 +202,14 @@ sequenceDiagram
     Note over S,T: 周期对账：库存摘要 → 采纳 / 标记 MISSING / 触发修复
 ```
 
+**实现状态**：变更日志（`<file_path>/report.journal`）、`ReportChunkEvents` 上报与 ACK 裁剪、
+周期库存对账（`GetInventory`）均已实现。当前对账会做三件事：把有效副本标记为 `VALID`、
+把缺失的副本从列表移除、在主副本数据缺失时提升一个有效副本作为新主副本。
+
 ## 10. 已知限制
 
 1. 元数据快照只在本机，尚未接入 Raft 日志复制，多 Tracker 之间仍可能不一致；
-2. Storage 变更上报与库存对账尚未实现（协议见上一节）；
-3. 没有容量配额与孤儿 Chunk GC；
+2. 孤儿 Chunk 只做记录，尚未实现 TTL 回收与后台副本修复；
+3. 没有容量配额；
 4. RPC 错误多以 Go `error` 返回，错误码体系尚未统一；
 5. 客户端与服务端之间没有 TLS / 鉴权。
