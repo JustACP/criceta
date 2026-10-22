@@ -34,6 +34,7 @@
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
+| `data_dir` | string | 元数据快照（`tracker_state.json`）与心跳 CSV 的根目录，默认 `data` |
 | `cluster_mode` | string | `standalone`（默认，不启动选举）/ `cluster` / `master-slave` |
 | `node_role` | string | `master` / `slave` / `node` |
 | `slot_range` | object | 预留的 FileID 分配区间，`{start, end}` |

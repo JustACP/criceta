@@ -40,13 +40,16 @@ const (
 )
 
 type cluster struct {
-	t           *testing.T
-	root        string
-	workDir     string
-	trackerAddr string
-	storageAddr map[int64]string
-	procs       []*exec.Cmd
-	logFiles    map[string]string
+	t             *testing.T
+	root          string
+	workDir       string
+	trackerAddr   string
+	trackerBin    string
+	trackerConfig string
+	trackerProc   *exec.Cmd
+	storageAddr   map[int64]string
+	procs         []*exec.Cmd
+	logFiles      map[string]string
 }
 
 func TestClusterWriteReplicateAndRewrite(t *testing.T) {
@@ -55,19 +58,13 @@ func TestClusterWriteReplicateAndRewrite(t *testing.T) {
 	}
 
 	c := startCluster(t, storageNodeNum)
-
-	trackerCli, err := trackerservice.NewClient(
-		"tracker.criceta",
-		client.WithHostPorts(c.trackerAddr),
-		client.WithRPCTimeout(2*time.Minute),
-	)
-	require.NoError(t, err)
+	trackerCli := newTrackerClient(t, c.trackerAddr)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 
 	// 1. Create a file and write 8 MiB through the client SDK.
-	_, err = trackerCli.CreateFile(ctx, &tracker.CreateFileRequest{
+	_, err := trackerCli.CreateFile(ctx, &tracker.CreateFileRequest{
 		Base:   newBaseRequest(),
 		Name:   "e2e.bin",
 		Length: fileSize,
@@ -129,6 +126,34 @@ func TestClusterWriteReplicateAndRewrite(t *testing.T) {
 	readBack, err = rewriter.ReadFile(ctx, file.Id, 0, fileSize)
 	require.NoError(t, err)
 	requireSameBytes(t, updated, readBack, "rewrite")
+
+	// 5. Restarting the tracker must not lose metadata: the file and its
+	//    content have to survive a full process restart.
+	c.restartTracker()
+
+	trackerCli = newTrackerClient(t, c.trackerAddr)
+	reader := nodeclient.NewClient(trackerCli)
+
+	reloaded := getFile(ctx, t, trackerCli, file.Id)
+	require.Equal(t, file.Id, reloaded.Id)
+	require.Equal(t, "e2e.bin", reloaded.Name)
+
+	afterRestart, err := reader.ReadFile(ctx, file.Id, 0, fileSize)
+	require.NoError(t, err)
+	requireSameBytes(t, updated, afterRestart, "after tracker restart")
+}
+
+func newTrackerClient(t *testing.T, addr string) trackerservice.Client {
+	t.Helper()
+
+	cli, err := trackerservice.NewClient(
+		"tracker.criceta",
+		client.WithHostPorts(addr),
+		client.WithRPCTimeout(2*time.Minute),
+	)
+	require.NoError(t, err)
+
+	return cli
 }
 
 // startCluster builds the binaries, writes configs into a temporary directory
@@ -156,11 +181,15 @@ func startCluster(t *testing.T, n int) *cluster {
 
 	trackerPort := freePort(t)
 	c.trackerAddr = fmt.Sprintf("127.0.0.1:%d", trackerPort)
+	c.trackerBin = trackerBin
 
-	trackerConfig := filepath.Join(c.workDir, "tracker.yaml")
-	require.NoError(t, os.WriteFile(trackerConfig, []byte(trackerConfigYAML(trackerPort)), 0o644))
+	trackerDataDir := filepath.Join(c.workDir, "tracker")
+	require.NoError(t, os.MkdirAll(trackerDataDir, 0o755))
 
-	c.start("tracker", trackerBin, "-config", trackerConfig)
+	c.trackerConfig = filepath.Join(c.workDir, "tracker.yaml")
+	require.NoError(t, os.WriteFile(c.trackerConfig, []byte(trackerConfigYAML(trackerPort, trackerDataDir)), 0o644))
+
+	c.start("tracker", trackerBin, "-config", c.trackerConfig)
 	waitForPort(t, c.trackerAddr)
 
 	for i := 0; i < n; i++ {
@@ -222,6 +251,37 @@ func (c *cluster) start(name, bin string, args ...string) {
 
 	c.procs = append(c.procs, cmd)
 	c.logFiles[name] = logPath
+
+	if name == "tracker" {
+		c.trackerProc = cmd
+	}
+}
+
+// restartTracker 停止 Tracker 并用同一份配置重新启动，
+// 用于验证元数据快照能让文件在进程重启后继续可见。
+func (c *cluster) restartTracker() {
+	c.t.Helper()
+
+	require.NotNil(c.t, c.trackerProc)
+
+	require.NoError(c.t, c.trackerProc.Process.Signal(os.Interrupt))
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = c.trackerProc.Process.Wait()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		_ = c.trackerProc.Process.Kill()
+		c.t.Fatal("tracker did not stop within 15s")
+	}
+
+	c.start("tracker", c.trackerBin, "-config", c.trackerConfig)
+	waitForPort(c.t, c.trackerAddr)
+	waitForNodes(c.t, c.trackerAddr, storageNodeNum)
 }
 
 func (c *cluster) stop() {
@@ -408,7 +468,7 @@ func tail(s string, lines int) string {
 	return strings.Join(parts[len(parts)-lines:], "\n")
 }
 
-func trackerConfigYAML(port int) string {
+func trackerConfigYAML(port int, dataDir string) string {
 	return fmt.Sprintf(`server_id: 1
 server_name: "tracker-1"
 server_ip: "127.0.0.1"
@@ -419,13 +479,15 @@ log:
   mode: "STDOUT"
   level: "INFO"
 
+data_dir: "%s"
+
 cluster_mode: "standalone"
 node_role: "master"
 
 slot_range:
   start: 0
   end: 1000000
-`, port)
+`, port, dataDir)
 }
 
 func storageConfigYAML(nodeID int64, port, trackerPort int, dataDir string) string {

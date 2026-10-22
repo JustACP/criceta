@@ -8,10 +8,12 @@ import (
 
 // TrackerNodeConfig Tracker server boot config.
 // ClusterMode defines how tracker nodes work together.
+// DataDir is where metadata snapshots and heartbeat records are stored.
 // SlotRange defines the range of file IDs this tracker can assign.
 type TrackerNodeConfig struct {
 	*ServerConfig
 	Log          *LogConfig     `json:"log"`
+	DataDir      string         `json:"data_dir"`
 	ClusterMode  string         `json:"cluster_mode"` // "standalone", "cluster", "master-slave"
 	NodeRole     string         `json:"node_role"`    // "master", "slave", "node"
 	Slot         *SlotRange     `json:"slot_range,omitempty"`
@@ -50,6 +52,9 @@ func (tc *TrackerNodeConfig) SaveConfig() map[string]any {
 	output := tc.ServerConfig.SaveConfig()
 
 	output["log"] = tc.Log.SaveConfig()
+	if tc.DataDir != "" {
+		output["data_dir"] = tc.DataDir
+	}
 	output["cluster_mode"] = tc.ClusterMode
 	output["node_role"] = tc.NodeRole
 
@@ -113,6 +118,12 @@ func (tc *TrackerNodeConfig) ReadConfig(input map[string]any) (Config, error) {
 		err = fmt.Errorf("tracker config read log config err: %s", err.Error())
 		logs.Error("%s", err.Error())
 		return nil, err
+	}
+
+	// Read optional data dir (defaults to "data")
+	tc.DataDir = "data"
+	if dataDir, err := getParam[string](input, "data_dir"); err == nil && dataDir != "" {
+		tc.DataDir = dataDir
 	}
 
 	// Read cluster mode

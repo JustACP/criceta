@@ -15,6 +15,9 @@ log:
 cluster_mode: "standalone"
 node_role: "master"
 
+# 元数据快照与心跳记录的存放目录
+data_dir: "data"
+
 # 可选的 slot range 配置
 slot_range:
   start: 0

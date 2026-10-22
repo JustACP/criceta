@@ -21,6 +21,8 @@
 - 分配 Chunk 时选择在线 Storage 节点，并记录文件写租约；
 - 客户端提交 Chunk 后更新文件版本，并异步触发副本同步；
 - 通过心跳感知 Storage 节点存活，超时（默认 30s）摘除；
+- 元数据变更后异步写入 `<data_dir>/tracker_state.json`（临时文件 + fsync + rename），
+  启动时自动恢复；
 - `cluster` 模式下参与 Raft 选举，`standalone` 模式不启动选举。
 
 ### Storage
@@ -146,11 +148,11 @@ Storage 节点在配置的 `chunk_storage.file_path` 下维护两个目录：
 | 副本同步失败 | 记录 `ERROR` 状态并输出日志；当前不会自动重试 |
 | 副本 CRC 不匹配 | 拒绝写入，保留本地已有副本 |
 | Storage 重启 | 从 `meta/` 恢复 Chunk 索引与 Slice 映射 |
-| Tracker 重启 | **元数据仅在内存，重启后丢失**（见路线图） |
+| Tracker 重启 | 从 `<data_dir>/tracker_state.json` 恢复文件、Chunk 与副本状态；节点心跳与写租约重新建立 |
 
 ## 9. 已知限制
 
-1. Tracker 元数据没有持久化，也没有接入 Raft 日志复制；
+1. 元数据快照只在本机，尚未接入 Raft 日志复制，多 Tracker 之间仍可能不一致；
 2. 读路径没有版本选择和副本故障转移；
 3. 没有容量配额、孤儿 Chunk GC 与后台副本修复；
 4. RPC 错误多以 Go `error` 返回，错误码体系尚未统一；

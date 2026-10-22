@@ -17,7 +17,7 @@ Criceta 的测试分三层，覆盖的粒度与运行成本依次递增。
 - 涉及磁盘的测试使用 `t.TempDir()` 作为数据目录；
 - `pkg/chunk` 的测试通过设置包级变量 `SlicePath` / `ChunkMetaPath` 指向临时目录；
 - `pkg/node/tracker` 的测试通过 `NewTrackerNodeWithDataDir` 注入临时目录，
-  避免在仓库里留下心跳 CSV。
+  避免在仓库里留下心跳 CSV；元数据持久化测试会在同一目录上重建节点，验证快照恢复。
 
 新增用例时应保持同样的约束：**不写死端口、不依赖仓库相对路径、不依赖执行顺序**。
 

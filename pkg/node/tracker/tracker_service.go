@@ -36,6 +36,14 @@ type TrackerNode struct {
 	raftState       *RaftState
 	heartbeatLog    *HeartbeatRecorder
 	healthCheckOnce sync.Once
+
+	// dataDir 下保存元数据快照与心跳记录
+	dataDir         string
+	persistCh       chan struct{}
+	persistStop     chan struct{}
+	persistOnce     sync.Once
+	persistStopOnce sync.Once
+	persistMux      sync.Mutex
 }
 
 // fileWriteLease 文件写租约。
@@ -48,8 +56,13 @@ type fileWriteLease struct {
 // writeLeaseTTL 写租约有效期：客户端崩溃后最多这么久文件即可被其他客户端接管
 const writeLeaseTTL = 30 * time.Second
 
+// NewTrackerNode 按配置中的数据目录创建 Tracker。
 func NewTrackerNode() *TrackerNode {
-	return newTrackerNode(defaultHeartbeatDir)
+	dataDir := defaultTrackerDataDir
+	if cfg, err := config.GetRawConfig[config.TrackerNodeConfig](); err == nil && cfg.DataDir != "" {
+		dataDir = cfg.DataDir
+	}
+	return newTrackerNode(dataDir)
 }
 
 // NewTrackerNodeWithDataDir 使用指定的数据目录创建 Tracker（测试用，避免污染工作区）
@@ -57,9 +70,12 @@ func NewTrackerNodeWithDataDir(dataDir string) *TrackerNode {
 	return newTrackerNode(dataDir)
 }
 
-func newTrackerNode(heartbeatDir string) *TrackerNode {
+func newTrackerNode(dataDir string) *TrackerNode {
+	if dataDir == "" {
+		dataDir = defaultTrackerDataDir
+	}
 
-	heartbeatLog, err := NewHeartbeatRecorder(heartbeatDir, 0)
+	heartbeatLog, err := NewHeartbeatRecorder(filepath.Join(dataDir, "heartbeats"), 0)
 	if err != nil {
 		logs.Error("Failed to create heartbeat recorder: %v", err)
 		return nil
@@ -70,6 +86,9 @@ func newTrackerNode(heartbeatDir string) *TrackerNode {
 		nodes:        make(map[uint64]*tracker.NodeInfo),
 		writeLock:    make(map[uint64]*fileWriteLease),
 		heartbeatLog: heartbeatLog,
+		dataDir:      dataDir,
+		persistCh:    make(chan struct{}, 1),
+		persistStop:  make(chan struct{}),
 	}
 	node.initRaft()
 	return node
@@ -189,6 +208,7 @@ func (t *TrackerNode) CreateFile(ctx context.Context, req *tracker.CreateFileReq
 	}
 
 	t.files[fileId] = fileMeta
+	t.markDirty()
 	logs.Info("File created successfully: id=%d, name=%s", fileId, req.Name)
 
 	return &tracker.CreateFileResponse{
@@ -358,6 +378,7 @@ func (t *TrackerNode) CommitChunk(ctx context.Context, req *tracker.CommitChunkR
 	file.ModifyTime = time.Now().UnixNano()
 	file.Version++
 	t.files[uint64(req.Chunk.FileId)] = file
+	t.markDirty()
 
 	// 选择副本节点（当前策略：取在线节点中最靠前的若干个）
 	// TODO 后续根据节点负载/网络拓扑选择
@@ -477,6 +498,7 @@ func (t *TrackerNode) setChunkReplicaStatus(fileId, chunkId, nodeId int64, statu
 	for _, replica := range file.ChunkReplicas[uint64(chunkId)] {
 		if replica.NodeId == nodeId {
 			replica.Status = int32(status)
+			t.markDirty()
 			return
 		}
 	}
@@ -568,6 +590,12 @@ const (
 )
 
 func (t *TrackerNode) Init() error {
+	// 先恢复上次运行留下的元数据，再对外提供服务
+	if err := t.loadSnapshot(); err != nil {
+		return err
+	}
+
+	t.startPersister()
 	t.StartNodeHealthCheck()
 	return nil
 }
@@ -645,6 +673,7 @@ func (t *TrackerNode) DeleteFile(ctx context.Context, req *tracker.DeleteFileReq
 	fileMeta.UpdateAt = time.Now().UnixNano()
 
 	delete(t.files, uint64(req.FileId))
+	t.markDirty()
 	// 删除成功后释放租约，避免死锁残留
 	if err := t.releaseWriteLease(uint64(req.FileId), requestClientId(req.Base)); err != nil {
 		logs.Warn("DeleteFile: release lease of file %d failed: %v", req.FileId, err)
@@ -1295,6 +1324,8 @@ func (t *TrackerNode) ProposeConfigChange(ctx context.Context, req *tracker.Prop
 
 func (t *TrackerNode) Close() error {
 	t.stopRaft()
+	// 关闭前做一次同步落盘，避免丢失最近一次元数据变更
+	t.stopPersister()
 	if t.heartbeatLog != nil {
 		if err := t.heartbeatLog.Close(); err != nil {
 			logs.Error("Failed to close heartbeat recorder: %v", err)
