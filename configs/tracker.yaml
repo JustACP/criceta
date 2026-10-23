@@ -18,6 +18,9 @@ node_role: "master"
 # 元数据快照与心跳记录的存放目录
 data_dir: "data"
 
+# 孤儿 Chunk 保留时间（秒）：超时后由 Tracker 通知 Storage 删除
+orphan_ttl: 300
+
 # 可选的 slot range 配置
 slot_range:
   start: 0

@@ -246,6 +246,9 @@ func (t *TrackerNode) reconcileInventories() {
 		}
 		t.applyInventory(node.NodeId, inventory)
 	}
+
+	// 对账后顺手补齐副本数不足的 Chunk
+	t.repairUnderReplicated()
 }
 
 // fetchInventory 返回 chunkID -> version。

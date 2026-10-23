@@ -14,6 +14,7 @@ type TrackerNodeConfig struct {
 	*ServerConfig
 	Log          *LogConfig     `json:"log"`
 	DataDir      string         `json:"data_dir"`
+	OrphanTTL    int64          `json:"orphan_ttl"`   // 孤儿 Chunk 保留时间（秒）
 	ClusterMode  string         `json:"cluster_mode"` // "standalone", "cluster", "master-slave"
 	NodeRole     string         `json:"node_role"`    // "master", "slave", "node"
 	Slot         *SlotRange     `json:"slot_range,omitempty"`
@@ -27,6 +28,9 @@ type SlotRange struct {
 	Start int64 `json:"start"`
 	End   int64 `json:"end"`
 }
+
+// defaultOrphanTTLSeconds 孤儿 Chunk 的默认保留时间（秒）
+const defaultOrphanTTLSeconds int64 = 300
 
 // 有效的集群模式和节点角色
 var (
@@ -54,6 +58,9 @@ func (tc *TrackerNodeConfig) SaveConfig() map[string]any {
 	output["log"] = tc.Log.SaveConfig()
 	if tc.DataDir != "" {
 		output["data_dir"] = tc.DataDir
+	}
+	if tc.OrphanTTL > 0 {
+		output["orphan_ttl"] = tc.OrphanTTL
 	}
 	output["cluster_mode"] = tc.ClusterMode
 	output["node_role"] = tc.NodeRole
@@ -124,6 +131,12 @@ func (tc *TrackerNodeConfig) ReadConfig(input map[string]any) (Config, error) {
 	tc.DataDir = "data"
 	if dataDir, err := getParam[string](input, "data_dir"); err == nil && dataDir != "" {
 		tc.DataDir = dataDir
+	}
+
+	// Read optional orphan TTL (defaults to 300s)
+	tc.OrphanTTL = defaultOrphanTTLSeconds
+	if orphanTTL, err := getParam[int64](input, "orphan_ttl"); err == nil && orphanTTL > 0 {
+		tc.OrphanTTL = orphanTTL
 	}
 
 	// Read cluster mode

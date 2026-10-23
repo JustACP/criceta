@@ -11,10 +11,12 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"hash/crc32"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -148,7 +150,44 @@ func TestClusterWriteReplicateAndRewrite(t *testing.T) {
 	require.NoError(t, err)
 	requireSameBytes(t, updated, afterRestart, "after tracker restart")
 
-	// 6. Losing the primary of a chunk must not break reads: the client has to
+	// 6. Orphan chunks must be reclaimed after their TTL. Write a chunk that no
+	//    file references (as if the client crashed before committing it) and
+	//    wait for the tracker to delete it from the storage node.
+	orphanChunkID := int64(991001)
+	orphanFileID := int64(424242)
+	orphanData := []byte("orphan-payload")
+	orphanCRC := strconv.FormatUint(uint64(crc32.ChecksumIEEE(orphanData)), 10)
+	orphanNode := int64(2)
+
+	storageCli := c.storageClient(t, orphanNode)
+	_, err = storageCli.SyncChunk(ctx, &storage.SyncChunkRequest{
+		Base: newBaseRequest(),
+		Meta: &storage.ChunkMeta{
+			Id:      orphanChunkID,
+			FileId:  orphanFileID,
+			Version: int64Ptr(1),
+			Offset:  0,
+			Size:    int64(len(orphanData)),
+			NodeId:  &orphanNode,
+			Crc:     &orphanCRC,
+		},
+		Data: orphanData,
+	})
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		_, readErr := storageCli.ReadChunk(ctx, &storage.ReadChunkRequest{
+			Base:    newBaseRequest(),
+			ChunkId: orphanChunkID,
+			Version: 1,
+			FileId:  orphanFileID,
+			Offset:  0,
+			Size:    int64(len(orphanData)),
+		})
+		return readErr != nil
+	}, 30*time.Second, 500*time.Millisecond, "orphan chunk was not reclaimed")
+
+	// 7. Losing the primary of a chunk must not break reads: the client has to
 	//    fall back to a healthy replica.
 	victim := int64(0)
 	for _, chunk := range meta.Chunks {
@@ -161,6 +200,24 @@ func TestClusterWriteReplicateAndRewrite(t *testing.T) {
 	degraded, err := reader.ReadFile(ctx, file.Id, 0, fileSize)
 	require.NoError(t, err)
 	requireSameBytes(t, updated, degraded, "read after primary failure")
+}
+
+func int64Ptr(v int64) *int64 { return &v }
+
+func (c *cluster) storageClient(t *testing.T, nodeID int64) storageservice.Client {
+	t.Helper()
+
+	addr, ok := c.storageAddr[nodeID]
+	require.True(t, ok, "unknown storage node %d", nodeID)
+
+	cli, err := storageservice.NewClient(
+		fmt.Sprintf("storage-%d", nodeID),
+		client.WithHostPorts(addr),
+		client.WithRPCTimeout(2*time.Minute),
+	)
+	require.NoError(t, err)
+
+	return cli
 }
 
 // stopStorage 停止指定 Storage 进程，模拟节点宕机。
@@ -551,6 +608,7 @@ log:
   level: "INFO"
 
 data_dir: "%s"
+orphan_ttl: 2
 
 cluster_mode: "standalone"
 node_role: "master"

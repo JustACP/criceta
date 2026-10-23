@@ -49,6 +49,8 @@ type TrackerNode struct {
 	reportMux   sync.RWMutex
 	nodeReports map[uint64]*nodeReportState
 	orphans     map[uint64]*orphanChunk
+	orphanTTL   time.Duration
+	repairing   map[uint64]bool
 }
 
 // fileWriteLease 文件写租约。
@@ -58,26 +60,40 @@ type fileWriteLease struct {
 	expireAt time.Time
 }
 
+// orphanTTL 默认的孤儿 Chunk 保留时间
+const defaultOrphanTTL = 300 * time.Second
+
 // writeLeaseTTL 写租约有效期：客户端崩溃后最多这么久文件即可被其他客户端接管
 const writeLeaseTTL = 30 * time.Second
 
-// NewTrackerNode 按配置中的数据目录创建 Tracker。
+// NewTrackerNode 按配置中的数据目录与孤儿 TTL 创建 Tracker。
 func NewTrackerNode() *TrackerNode {
 	dataDir := defaultTrackerDataDir
-	if cfg, err := config.GetRawConfig[config.TrackerNodeConfig](); err == nil && cfg.DataDir != "" {
-		dataDir = cfg.DataDir
+	orphanTTL := defaultOrphanTTL
+
+	if cfg, err := config.GetRawConfig[config.TrackerNodeConfig](); err == nil {
+		if cfg.DataDir != "" {
+			dataDir = cfg.DataDir
+		}
+		if cfg.OrphanTTL > 0 {
+			orphanTTL = time.Duration(cfg.OrphanTTL) * time.Second
+		}
 	}
-	return newTrackerNode(dataDir)
+
+	return newTrackerNode(dataDir, orphanTTL)
 }
 
 // NewTrackerNodeWithDataDir 使用指定的数据目录创建 Tracker（测试用，避免污染工作区）
 func NewTrackerNodeWithDataDir(dataDir string) *TrackerNode {
-	return newTrackerNode(dataDir)
+	return newTrackerNode(dataDir, defaultOrphanTTL)
 }
 
-func newTrackerNode(dataDir string) *TrackerNode {
+func newTrackerNode(dataDir string, orphanTTL time.Duration) *TrackerNode {
 	if dataDir == "" {
 		dataDir = defaultTrackerDataDir
+	}
+	if orphanTTL <= 0 {
+		orphanTTL = defaultOrphanTTL
 	}
 
 	heartbeatLog, err := NewHeartbeatRecorder(filepath.Join(dataDir, "heartbeats"), 0)
@@ -96,6 +112,8 @@ func newTrackerNode(dataDir string) *TrackerNode {
 		persistStop:  make(chan struct{}),
 		nodeReports:  make(map[uint64]*nodeReportState),
 		orphans:      make(map[uint64]*orphanChunk),
+		orphanTTL:    orphanTTL,
+		repairing:    make(map[uint64]bool),
 	}
 	node.initRaft()
 	return node
@@ -608,6 +626,7 @@ func (t *TrackerNode) Init() error {
 	t.startPersister()
 	t.StartNodeHealthCheck()
 	go t.runReconciler()
+	go t.runOrphanGC()
 	return nil
 }
 
@@ -628,16 +647,48 @@ func (t *TrackerNode) StartNodeHealthCheck() {
 }
 
 func (t *TrackerNode) cleanupInactiveNodes() {
-	t.nodeMux.Lock()
-	defer t.nodeMux.Unlock()
+	var removed []uint64
 
+	t.nodeMux.Lock()
 	now := time.Now()
 	for id, node := range t.nodes {
 		if now.Sub(time.Unix(0, node.LastHeartbeat)) > nodeHeartbeatTimeout {
 			logs.Warn("Node is inactive, marking as offline:%v", node.NodeId)
 			node.Status = base.NodeStatus(base.NodeStatus_OFFLINE)
 			delete(t.nodes, id)
+			removed = append(removed, id)
 		}
+	}
+	t.nodeMux.Unlock()
+
+	// 离线节点不再持有副本：把它们从副本列表中移除，主副本则提升其他副本
+	for _, nodeID := range removed {
+		t.pruneNodeReplicas(nodeID)
+	}
+}
+
+// pruneNodeReplicas 移除某个节点在全部 Chunk 上的副本记录。
+func (t *TrackerNode) pruneNodeReplicas(nodeID uint64) {
+	changed := false
+
+	t.fileMux.Lock()
+	for _, file := range t.files {
+		for _, chunkMeta := range file.Chunks {
+			if chunkMeta.NodeId == nodeID {
+				if t.promoteReplicaLocked(file, chunkMeta, nodeID) {
+					changed = true
+				}
+				continue
+			}
+			if t.dropReplicaLocked(file, chunkMeta, nodeID) {
+				changed = true
+			}
+		}
+	}
+	t.fileMux.Unlock()
+
+	if changed {
+		t.markDirty()
 	}
 }
 

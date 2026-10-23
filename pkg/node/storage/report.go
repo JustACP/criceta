@@ -345,3 +345,45 @@ func (s *StorageNode) GetInventory(ctx context.Context, req *storage.GetInventor
 		Chunks: entries,
 	}, nil
 }
+
+// DeleteChunk 删除本地 Chunk 及其全部 Slice 文件，由 Tracker 在孤儿回收时调用。
+func (s *StorageNode) DeleteChunk(ctx context.Context, req *storage.DeleteChunkRequest) (*storage.DeleteChunkResponse, error) {
+	chunkID := uint64(req.ChunkId)
+
+	s.chunkMux.Lock()
+	chk, exists := s.chunks[chunkID]
+	if exists {
+		delete(s.chunks, chunkID)
+	}
+	s.chunkMux.Unlock()
+
+	// 幂等：重复删除同样返回成功
+	if !exists {
+		return &storage.DeleteChunkResponse{
+			Base: &base.BaseResponse{
+				Code:      base.SUCCESS,
+				Message:   "chunk not found",
+				Timestamp: time.Now().UnixNano(),
+			},
+			Success: true,
+		}, nil
+	}
+
+	head := headSnapshot(chk.SnapshotHead())
+	if err := chk.Delete(); err != nil {
+		return nil, fmt.Errorf("delete chunk %d: %w", chunkID, err)
+	}
+
+	s.enqueueReport(reportOpDelete, head)
+
+	logs.Info("Deleted chunk %d (file %d)", head.id, head.fileId)
+
+	return &storage.DeleteChunkResponse{
+		Base: &base.BaseResponse{
+			Code:      base.SUCCESS,
+			Message:   "success",
+			Timestamp: time.Now().UnixNano(),
+		},
+		Success: true,
+	}, nil
+}

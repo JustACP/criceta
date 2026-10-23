@@ -6,6 +6,8 @@ import (
 
 	"github.com/JustACP/criceta/kitex_gen/criceta/base"
 	"github.com/JustACP/criceta/kitex_gen/criceta/tracker"
+	"github.com/JustACP/criceta/pkg/chunk"
+	"github.com/JustACP/criceta/pkg/meta"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -116,6 +118,31 @@ func TestCommitClearsOrphan(t *testing.T) {
 	_, stillOrphan := node.orphans[777]
 	node.fileMux.RUnlock()
 	assert.False(t, stillOrphan)
+}
+
+// TestSelectRepairTarget 修复目标必须是“在线且尚未持有该 Chunk”的节点。
+func TestSelectRepairTarget(t *testing.T) {
+	file := &meta.FileMeta{
+		Chunks: map[uint64]*meta.ChunkMeta{
+			10: {ChunkHead: chunk.ChunkHead{Id: 10}, NodeId: 1},
+		},
+		ChunkReplicas: map[uint64][]*base.ReplicaInfo{
+			10: {{NodeId: 2, Status: int32(base.ChunkStatus_VALID)}},
+		},
+	}
+	chunkMeta := file.Chunks[10]
+
+	nodes := []*tracker.NodeInfo{{NodeId: 1}, {NodeId: 2}, {NodeId: 3}}
+	target := selectRepairTarget(file, chunkMeta, nodes)
+	require.NotNil(t, target)
+	assert.Equal(t, int64(3), target.NodeId)
+
+	// 所有在线节点都持有该 Chunk 时没有可用的修复目标
+	file.ChunkReplicas[10] = append(file.ChunkReplicas[10], &base.ReplicaInfo{
+		NodeId: 3,
+		Status: int32(base.ChunkStatus_VALID),
+	})
+	assert.Nil(t, selectRepairTarget(file, chunkMeta, nodes))
 }
 
 // TestApplyInventoryPromotesReplica 主副本数据丢失时，把有效副本提升为主副本。

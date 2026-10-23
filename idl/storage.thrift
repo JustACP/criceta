@@ -215,6 +215,17 @@ struct GetInventoryResponse {
     2: list<ChunkInventoryEntry> chunks
 }
 
+// 删除 Chunk：由 Tracker 在孤儿回收或副本迁移后下发
+struct DeleteChunkRequest {
+    1: base.BaseRequest base
+    2: i64 chunk_id
+}
+
+struct DeleteChunkResponse {
+    1: base.BaseResponse base
+    2: bool success
+}
+
 service StorageService {
     WriteChunkResponse WriteChunk(1: WriteChunkRequest req)
     ReadChunkResponse ReadChunk(1: ReadChunkRequest req)
@@ -227,6 +238,9 @@ service StorageService {
 
     // 库存对账
     GetInventoryResponse GetInventory(1: GetInventoryRequest req)
+
+    // 孤儿回收
+    DeleteChunkResponse DeleteChunk(1: DeleteChunkRequest req)
     
     // 快照相关接口
     CreateSnapshotResponse CreateSnapshot(1: CreateSnapshotRequest req)

@@ -2,6 +2,7 @@ package chunk
 
 import (
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -506,4 +507,33 @@ func (sc *SliceBasedChunk) SnapshotHead() ChunkHead {
 	defer sc.mu.RUnlock()
 
 	return *sc.Head
+}
+
+// Delete 删除 Chunk 的元数据文件与全部 Slice 文件。
+// 调用后该 Chunk 不可再使用。
+func (sc *SliceBasedChunk) Delete() error {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	var errs error
+
+	for _, slice := range sc.SliceManager.Slices {
+		if err := slice.Remove(); err != nil {
+			errs = errors.Join(errs, err)
+		}
+	}
+
+	if sc.meta != nil {
+		path := sc.meta.Name()
+		if err := sc.meta.Close(); err != nil {
+			errs = errors.Join(errs, err)
+		}
+		sc.meta = nil
+
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			errs = errors.Join(errs, err)
+		}
+	}
+
+	return errs
 }
